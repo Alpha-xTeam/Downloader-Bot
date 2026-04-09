@@ -21,6 +21,26 @@ let YOUTUBE_COOKIES_FILE = process.env.YTDLP_YOUTUBE_COOKIES_FILE || (fs.existsS
 let SOCIAL_COOKIES_FILE = process.env.YTDLP_SOCIAL_COOKIES_FILE || (fs.existsSync(path.join(__dirname, 'cookies2.txt')) ? path.join(__dirname, 'cookies2.txt') : GLOBAL_COOKIES_FILE);
 const HAS_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
+function resolveCookiesFile(platform) {
+  const runtimeFileName = platform === 'youtube' ? 'cookies-youtube.txt' : 'cookies-social.txt';
+  const fallbackLocalFile = platform === 'youtube' ? 'cookies.txt' : 'cookies2.txt';
+  const candidates = [
+    platform === 'youtube' ? process.env.YTDLP_YOUTUBE_COOKIES_FILE : process.env.YTDLP_SOCIAL_COOKIES_FILE,
+    platform === 'youtube' ? YOUTUBE_COOKIES_FILE : SOCIAL_COOKIES_FILE,
+    path.join(__dirname, '.runtime', runtimeFileName),
+    path.join(__dirname, fallbackLocalFile),
+    GLOBAL_COOKIES_FILE
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return '';
+}
+
 // Token must come from the runtime environment.
 const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) {
@@ -216,8 +236,9 @@ function buildYtDlpBaseArgs(cookiesFile = '') {
 }
 
 function buildYoutubeDlpArgs(extraArgs = '') {
+  // Always check current variable value which is updated at startup
   const baseArgs = [
-    buildYtDlpBaseArgs(YOUTUBE_COOKIES_FILE),
+    buildYtDlpBaseArgs(resolveCookiesFile('youtube')),
     '--extractor-args "youtube:player_client=android,web"',
     '--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"'
   ];
@@ -230,7 +251,7 @@ function buildYoutubeDlpArgs(extraArgs = '') {
 }
 
 function buildSocialDlpArgs(extraArgs = '') {
-  const baseArgs = [buildYtDlpBaseArgs(SOCIAL_COOKIES_FILE)];
+  const baseArgs = [buildYtDlpBaseArgs(resolveCookiesFile('social'))];
 
   if (extraArgs) {
     baseArgs.push(extraArgs);
@@ -1740,6 +1761,8 @@ async function startBot() {
     
     YOUTUBE_COOKIES_FILE = youtubeResult;
     SOCIAL_COOKIES_FILE = socialResult;
+    process.env.YTDLP_YOUTUBE_COOKIES_FILE = YOUTUBE_COOKIES_FILE;
+    process.env.YTDLP_SOCIAL_COOKIES_FILE = SOCIAL_COOKIES_FILE;
     
     console.log(`[Startup] YT Cookies: ${YOUTUBE_COOKIES_FILE || 'None'}`);
     console.log(`[Startup] Social Cookies: ${SOCIAL_COOKIES_FILE || 'None'}`);
