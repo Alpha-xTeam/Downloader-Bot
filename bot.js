@@ -225,6 +225,62 @@ function supabaseRequest(endpoint, { method = 'GET', query = '', body = null, pr
   });
 }
 
+function downloadTextFromUrl(url, targetPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(targetPath);
+
+    const request = https.get(url, (response) => {
+      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        file.close(() => fs.unlink(targetPath, () => {}));
+        resolve(downloadTextFromUrl(response.headers.location, targetPath));
+        return;
+      }
+
+      if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+        file.close(() => fs.unlink(targetPath, () => {}));
+        reject(new Error(`Failed to download file from ${url} (status ${response.statusCode || 'unknown'})`));
+        return;
+      }
+
+      response.pipe(file);
+      file.on('finish', () => {
+        file.close(() => resolve(targetPath));
+      });
+    });
+
+    request.on('error', (error) => {
+      file.close(() => fs.unlink(targetPath, () => {}));
+      reject(error);
+    });
+
+    file.on('error', (error) => {
+      file.close(() => fs.unlink(targetPath, () => {}));
+      reject(error);
+    });
+  });
+}
+
+async function prepareCookiesFile(existingFile, remoteUrl, runtimeName) {
+  if (existingFile && fs.existsSync(existingFile)) {
+    return existingFile;
+  }
+
+  if (!remoteUrl) {
+    return '';
+  }
+
+  const runtimeDir = path.join(__dirname, '.runtime');
+  if (!fs.existsSync(runtimeDir)) {
+    fs.mkdirSync(runtimeDir, { recursive: true });
+  }
+
+  const runtimePath = path.join(runtimeDir, runtimeName);
+  console.log(`[Cookies] Downloading cookies from ${remoteUrl} to ${runtimePath}`);
+  await downloadTextFromUrl(remoteUrl, runtimePath);
+  console.log(`[Cookies] Downloaded successfully: ${runtimePath}`);
+  return runtimePath;
+}
+
 function buildYtDlpBaseArgs(cookiesFile = '') {
   const args = ['--no-playlist'];
 
