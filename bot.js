@@ -430,7 +430,13 @@ function buildSocialDlpArgs(extraArgs = '') {
 
 function isYouTubeBotChallengeError(error) {
   const message = `${error?.message || ''} ${error?.stderr || ''} ${error?.response?.body?.description || ''}`.toLowerCase();
-  return message.includes('sign in to confirm you\'re not a bot') || message.includes('precondition check failed') || message.includes('http error 400: bad request');
+  // Check for both straight (') and curly (') apostrophes
+  const normalizedMessage = message.replace(/['']/g, "'");
+  return normalizedMessage.includes('sign in to confirm you\'re not a bot') || 
+         normalizedMessage.includes('sign in to confirm youre not a bot') ||
+         message.includes('precondition check failed') || 
+         message.includes('http error 400: bad request') ||
+         message.includes('bot');
 }
 
 function isYouTubeCookiesInvalidError(error) {
