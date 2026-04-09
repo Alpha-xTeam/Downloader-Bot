@@ -377,10 +377,11 @@ function buildYtDlpBaseArgs(cookiesFile = '') {
 
 function buildYoutubeDlpArgs(extraArgs = '') {
   // Always check current variable value which is updated at startup
+  // Use android client: supports cookies, no JS challenges needed
   const baseArgs = [
     buildYtDlpBaseArgs(resolveCookiesFile('youtube')),
-    '--extractor-args "youtube:player_client=ios;player_skip=webpage"',
-    '--user-agent "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"'
+    '--extractor-args "youtube:player_client=android;player_skip=webpage"',
+    '--user-agent "com.google.android.youtube/19.29.1 (Linux; U; Android 14) gzip"'
   ];
 
   if (extraArgs) {
