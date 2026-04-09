@@ -15,7 +15,9 @@
       "Bash(supabase *)",
       "Bash(c:\\supabase\\supabase.exe *)",
       "Bash(chcp *)",
-      "Bash(node *)"
+      "Bash(node *)",
+      "Bash(findstr *)",
+      "Bash(del *)"
     ]
   },
   "$version": 3

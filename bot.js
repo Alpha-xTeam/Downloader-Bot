@@ -312,6 +312,38 @@ function downloadTextFromUrl(url, targetPath) {
   });
 }
 
+// Helper: Download image from URL with proper redirect handling
+function downloadImage(url, targetPath) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+      }
+    }, (response) => {
+      // Handle redirects
+      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        resolve(downloadImage(response.headers.location, targetPath));
+        return;
+      }
+
+      if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+        reject(new Error(`Failed to download image from ${url} (status ${response.statusCode || 'unknown'})`));
+        return;
+      }
+
+      const file = fs.createWriteStream(targetPath);
+      response.pipe(file);
+      file.on('finish', () => {
+        file.close(() => resolve(targetPath));
+      });
+    });
+
+    request.on('error', (error) => {
+      reject(error);
+    });
+  });
+}
+
 async function prepareCookiesFile(existingFile, remoteUrl, runtimeName) {
   if (existingFile && fs.existsSync(existingFile)) {
     return existingFile;
@@ -360,8 +392,34 @@ function buildYoutubeDlpArgs(extraArgs = '') {
   return baseArgs.filter(Boolean).join(' ');
 }
 
+// Helper: Refresh YouTube cookies from remote URL
+async function refreshYouTubeCookies() {
+  try {
+    console.log('[Cookies] Refreshing YouTube cookies from remote URL...');
+    const runtimeDir = path.join(__dirname, '.runtime');
+    if (!fs.existsSync(runtimeDir)) {
+      fs.mkdirSync(runtimeDir, { recursive: true });
+    }
+    
+    const runtimePath = path.join(runtimeDir, 'cookies-youtube.txt');
+    await downloadTextFromUrl(YOUTUBE_COOKIES_URL, runtimePath);
+    
+    YOUTUBE_COOKIES_FILE = runtimePath;
+    process.env.YTDLP_YOUTUBE_COOKIES_FILE = runtimePath;
+    
+    console.log(`[Cookies] YouTube cookies refreshed: ${runtimePath}`);
+    return true;
+  } catch (error) {
+    console.error('[Cookies] Failed to refresh YouTube cookies:', error.message);
+    return false;
+  }
+}
+
 function buildSocialDlpArgs(extraArgs = '') {
-  const baseArgs = [buildYtDlpBaseArgs(resolveCookiesFile('social'))];
+  const baseArgs = [
+    buildYtDlpBaseArgs(resolveCookiesFile('social')),
+    '--extractor-retries 3'
+  ];
 
   if (extraArgs) {
     baseArgs.push(extraArgs);
@@ -750,13 +808,750 @@ function isTikTokUrl(url) {
   return detectPlatform(url) === 'tiktok';
 }
 
+// Helper: Get TikTok info via external API when yt-dlp fails
+function getTikTokInfo(url) {
+  return new Promise(async (resolve, reject) => {
+    // Try yt-dlp first
+    const args = buildSocialDlpArgs();
+    exec(`yt-dlp ${args} --dump-json "${url}"`, async (error, stdout, stderr) => {
+      // If yt-dlp succeeded, parse the JSON
+      if (!error && stdout.trim()) {
+        try {
+          const info = JSON.parse(stdout);
+          resolve(info);
+          return;
+        } catch (e) {}
+      }
+
+      // yt-dlp failed - fallback to external API
+      console.log('[TikTok] yt-dlp failed, using external API fallback');
+
+      try {
+        const https = require('https');
+        
+        // First, follow the short URL to get the actual URL
+        const followRedirect = (shortUrl) => {
+          return new Promise((resolveRedirect, rejectRedirect) => {
+            https.get(shortUrl, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              }
+            }, (response) => {
+              if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                resolveRedirect(response.headers.location);
+              } else {
+                resolveRedirect(shortUrl);
+              }
+            }).on('error', rejectRedirect);
+          });
+        };
+
+        const finalUrl = await followRedirect(url);
+        console.log('[TikTok] Final URL:', finalUrl);
+
+        // Extract video/photo ID from URL
+        const urlObj = new URL(finalUrl);
+        const pathParts = urlObj.pathname.split('/');
+        const itemId = pathParts[pathParts.length - 1];
+
+        if (!itemId || itemId.length < 5) {
+          throw new Error('Could not extract TikTok video ID');
+        }
+
+        console.log('[TikTok] Extracted ID:', itemId);
+
+        // Try multiple TikTok downloader APIs
+        const apis = [
+          `https://tikwm.com/api/?url=${encodeURIComponent(finalUrl)}`,
+          `https://www.tiktok.com/oembed?url=${encodeURIComponent(finalUrl)}`
+        ];
+
+        // Try tikwm.com API first
+        https.get(apis[0], {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://tikwm.com/'
+          },
+          timeout: 15000
+        }, (response) => {
+          let data = '';
+          response.on('data', (chunk) => { data += chunk; });
+          response.on('end', () => {
+            try {
+              const apiData = JSON.parse(data);
+              
+              if (apiData.code === 0 && apiData.data) {
+                const tiktokData = apiData.data;
+                const result = {
+                  title: tiktokData.title || tiktokData.desc || 'TikTok Content',
+                  uploader: tiktokData.author?.nickname || tiktokData.author?.unique_id || 'Unknown',
+                  author_id: tiktokData.author?.unique_id || '',
+                  thumbnail: tiktokData.origin_cover || tiktokData.cover,
+                  type: 'unknown'
+                };
+
+                // Check if it's a photo/slideshow
+                if (tiktokData.images && tiktokData.images.length > 0) {
+                  result.type = 'photo';
+                  result.isSlideshow = tiktokData.images.length > 1;
+                  result.images = tiktokData.images;
+                  console.log(`[TikTok] Found ${tiktokData.images.length} images from API`);
+                  resolve(result);
+                  return;
+                }
+                
+                // It's a video
+                if (tiktokData.play) {
+                  result.type = 'video';
+                  result.url = tiktokData.play;
+                  result.wmplay = tiktokData.wmplay; // watermarked version
+                  result.duration = tiktokData.duration;
+                  console.log('[TikTok] Found video URL from API');
+                  resolve(result);
+                  return;
+                }
+              }
+
+              // API failed - try oEmbed
+              console.log('[TikTok] First API failed, trying oEmbed...');
+              tryOEmbed(finalUrl, resolve, reject);
+              
+            } catch (e) {
+              console.log('[TikTok] API parse error:', e.message);
+              tryOEmbed(finalUrl, resolve, reject);
+            }
+          });
+        }).on('error', (err) => {
+          console.log('[TikTok] API error:', err.message);
+          tryOEmbed(finalUrl, resolve, reject);
+        });
+
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+// Helper: Try TikTok oEmbed as last resort
+function tryOEmbed(url, resolve, reject) {
+  const https = require('https');
+  const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`;
+
+  https.get(oembedUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    },
+    timeout: 10000
+  }, (response) => {
+    let data = '';
+    response.on('data', (chunk) => { data += chunk; });
+    response.on('end', () => {
+      try {
+        const oembed = JSON.parse(data);
+        
+        if (oembed.title) {
+          resolve({
+            title: oembed.title,
+            uploader: oembed.author_name || 'Unknown',
+            thumbnail: oembed.thumbnail_url,
+            type: 'video', // Assume video since we couldn't detect
+            url: null // Will use yt-dlp for download
+          });
+          return;
+        }
+      } catch (e) {}
+      
+      reject(new Error('All TikTok info extraction methods failed'));
+    });
+  }).on('error', reject);
+}
+
+// Helper: Get Instagram info via external API when yt-dlp fails
+function getInstagramInfo(url) {
+  return new Promise(async (resolve, reject) => {
+    // Clean URL - remove tracking parameters
+    let cleanUrl = url.split('?')[0];
+    // Ensure trailing slash for consistency
+    if (!cleanUrl.endsWith('/')) cleanUrl += '/';
+
+    const cookiesFile = resolveCookiesFile('social');
+
+    // Try yt-dlp first (with cookies)
+    const args = buildSocialDlpArgs();
+    exec(`yt-dlp ${args} --dump-json "${cleanUrl}"`, async (error, stdout, stderr) => {
+      // If yt-dlp succeeded, parse the JSON
+      if (!error && stdout.trim()) {
+        try {
+          const info = JSON.parse(stdout);
+          resolve(info);
+          return;
+        } catch (e) {}
+      }
+
+      // yt-dlp failed - fallback to GraphQL API with cookies
+      console.log('[Instagram] yt-dlp failed, using GraphQL API with cookies');
+
+      try {
+        const https = require('https');
+        const fs = require('fs');
+        
+        const result = {
+          title: 'Instagram Post',
+          uploader: 'Unknown',
+          type: 'unknown'
+        };
+
+        // Read cookies
+        let cookies = {};
+        if (cookiesFile && fs.existsSync(cookiesFile)) {
+          try {
+            const cookiesContent = fs.readFileSync(cookiesFile, 'utf8');
+            
+            // Try to parse as JSON first
+            try {
+              const jsonCookies = JSON.parse(cookiesContent);
+              if (Array.isArray(jsonCookies)) {
+                jsonCookies.forEach(cookie => {
+                  cookies[cookie.name] = cookie.value;
+                });
+              } else if (typeof jsonCookies === 'object') {
+                Object.assign(cookies, jsonCookies);
+              }
+            } catch (e) {
+              // Try Netscape format
+              const cookieLines = cookiesContent.split('\n').filter(line => line && !line.startsWith('#'));
+              cookieLines.forEach(line => {
+                const parts = line.split('\t');
+                if (parts.length >= 7) {
+                  cookies[parts[5]] = parts[6];
+                }
+              });
+            }
+          } catch (e) {
+            console.log('[Instagram] Failed to read cookies:', e.message);
+          }
+        }
+
+        // Extract shortcode from URL
+        let shortcode = '';
+        const match1 = cleanUrl.match(/\/p\/([A-Za-z0-9_-]+)/);
+        const match2 = cleanUrl.match(/\/reel\/([A-Za-z0-9_-]+)/);
+        const match3 = cleanUrl.match(/\/tv\/([A-Za-z0-9_-]+)/);
+        shortcode = (match1 || match2 || match3 || [])[1] || '';
+
+        if (!shortcode) {
+          console.log('[Instagram] Could not extract shortcode from URL');
+          resolve(result);
+          return;
+        }
+
+        console.log('[Instagram] Extracted shortcode:', shortcode);
+
+        // Instagram GraphQL query for post data
+        const queryHash = '67d501774501d4c0f976578d45473dd3'; // Instagram's shortcode media query hash
+        const variables = JSON.stringify({
+          shortcode: shortcode,
+          fetch_tagged_media_count: 0
+        });
+
+        const graphqlUrl = `https://www.instagram.com/graphql/query/?query_hash=${queryHash}&variables=${encodeURIComponent(variables)}`;
+
+        // Build cookie header
+        const cookieParts = [];
+        Object.keys(cookies).forEach(key => {
+          const sanitizedValue = cookies[key].replace(/[\r\n\t\x00-\x1F\x7F]/g, '').trim();
+          if (sanitizedValue) {
+            cookieParts.push(`${key}=${sanitizedValue}`);
+          }
+        });
+
+        const headers = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+          'Accept': 'application/json, text/plain, */*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'X-IG-App-ID': '936619743392459',
+          'X-IG-WWW-Claim': '0',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Referer': cleanUrl,
+          'Connection': 'keep-alive'
+        };
+
+        if (cookieParts.length > 0) {
+          headers['Cookie'] = cookieParts.join('; ');
+          console.log(`[Instagram] Using ${cookieParts.length} cookies for GraphQL request`);
+        }
+
+        console.log('[Instagram] GraphQL URL:', graphqlUrl.substring(0, 80) + '...');
+
+        // Make GraphQL request
+        https.get(graphqlUrl, { headers, timeout: 15000 }, (response) => {
+          let data = '';
+          response.on('data', (chunk) => { data += chunk; });
+          response.on('end', () => {
+            try {
+              console.log('[Instagram] GraphQL response status:', response.statusCode);
+              console.log('[Instagram] GraphQL response length:', data.length);
+              
+              if (data.length > 0) {
+                console.log('[Instagram] GraphQL response preview:', data.substring(0, 200));
+              }
+              
+              if (response.statusCode === 400 || response.statusCode === 401 || response.statusCode === 403) {
+                console.log('[Instagram] GraphQL API returned error status - likely authorization issue or API update');
+                extractFromHtmlPage(cleanUrl, result, headers, resolve, reject);
+                return;
+              }
+              
+              const graphqlResponse = JSON.parse(data);
+              
+              if (graphqlResponse.data) {
+                const media = graphqlResponse.data.xdt_shortcode_media || graphqlResponse.data.shortcode_media;
+                console.log('[Instagram] Media found in GraphQL:', !!media);
+                
+                if (media) {
+                  // Extract title and author
+                  if (media.caption?.text) result.title = media.caption.text;
+                  if (media.owner?.username) result.uploader = media.owner.username;
+                  else if (media.user?.username) result.uploader = media.user.username;
+
+                  // Check if it's a carousel
+                  if (media.edge_sidecar_to_children?.edges?.length > 0) {
+                    const edges = media.edge_sidecar_to_children.edges;
+                    result.isCarousel = true;
+                    result.carouselItems = [];
+                    
+                    edges.forEach((edge) => {
+                      const node = edge.node || edge;
+                      const typename = node.__typename || '';
+                      
+                      if (typename.includes('Image') || node.display_url) {
+                        result.carouselItems.push({
+                          type: 'image',
+                          url: node.display_url || node.display_resources?.[node.display_resources.length - 1]?.src
+                        });
+                      } else if (typename.includes('Video') || node.video_url) {
+                        result.carouselItems.push({
+                          type: 'video',
+                          url: node.video_url || node.video_playback_url
+                        });
+                      }
+                    });
+                    
+                    console.log(`[Instagram] Found carousel with ${result.carouselItems.length} items via GraphQL`);
+                    resolve(result);
+                    return;
+                  }
+                  
+                  // Single image
+                  if (media.display_url) {
+                    result.type = 'image';
+                    result.url = media.display_url || media.display_resources?.[media.display_resources.length - 1]?.src;
+                    console.log('[Instagram] Found single image via GraphQL');
+                    resolve(result);
+                    return;
+                  }
+                  
+                  // Video
+                  if (media.video_url || media.video_playback_url) {
+                    result.type = 'video';
+                    result.url = media.video_url || media.video_playback_url;
+                    result.duration = media.video_duration;
+                    console.log('[Instagram] Found video via GraphQL');
+                    resolve(result);
+                    return;
+                  }
+                }
+              }
+
+              // GraphQL failed, try fetching HTML page
+              console.log('[Instagram] GraphQL failed, trying HTML extraction');
+              extractFromHtmlPage(cleanUrl, result, headers, resolve, reject);
+
+            } catch (e) {
+              console.log('[Instagram] GraphQL parse error:', e.message);
+              extractFromHtmlPage(cleanUrl, result, headers, resolve, reject);
+            }
+          });
+        }).on('error', (err) => {
+          console.log('[Instagram] GraphQL request error:', err.message);
+          extractFromHtmlPage(cleanUrl, result, headers, resolve, reject);
+        });
+
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+// Helper: Extract from HTML page
+function extractFromHtmlPage(url, result, headers, resolve, reject) {
+  const https = require('https');
+  
+  // Improve headers for HTML page request
+  const pageHeaders = {
+    ...headers,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Upgrade-Insecure-Requests': '1',
+    'Cache-Control': 'max-age=0'
+  };
+  
+  console.log('[Instagram] Fetching HTML page...');
+  https.get(url, { headers: pageHeaders, timeout: 15000 }, (response) => {
+    console.log('[Instagram] HTML response status:', response.statusCode);
+    let html = '';
+    response.on('data', (chunk) => { html += chunk; });
+    response.on('end', () => {
+      console.log('[Instagram] HTML page received, length:', html.length);
+      try {
+        parseInstagramHtml(html, url, result, resolve, reject);
+      } catch (e) {
+        console.log('[Instagram] HTML parse exception:', e.message);
+        reject(new Error('Failed to parse Instagram HTML'));
+      }
+    });
+  }).on('error', (err) => {
+    console.log('[Instagram] HTML extraction error:', err.message);
+    resolve(result);
+  });
+}
+
+// Helper: Parse Instagram HTML content
+function parseInstagramHtml(html, url, result, resolve, reject) {
+  try {
+    console.log('[Instagram] HTML page received, length:', html.length);
+    
+    // Method 0: Extract sharedData from new format
+    if (!result.url && !result.carouselItems) {
+      try {
+        // Look for window.sharedData or similar patterns
+        const sharedDataRegex = /window\.__NRML_INIT_DATA__\s*=\s*({.*?});\n/;
+        const match = html.match(sharedDataRegex);
+        if (match) {
+          console.log('[Instagram] Method 0: Found __NRML_INIT_DATA__');
+          const data = JSON.parse(match[1]);
+          if (data && data.nrml_context && data.nrml_context.data) {
+            extractFromMedia(data.nrml_context.data, result);
+          }
+        }
+      } catch (e) {
+        console.log('[Instagram] Method 0 failed:', e.message);
+      }
+    }
+    
+    // Method 1: Try __additionalDataLoaded (newer format)
+    if (!result.url && !result.carouselItems) {
+      const additionalDataMatch = html.match(/<script type="text\/javascript">window\.__additionalDataLoaded\s*=\s*window\.__additionalDataLoaded\s*\|\|\s*\{\};\s*Object\.assign\(window\.__additionalDataLoaded,\s*({.*?})\);<\/script>/);
+      
+      if (additionalDataMatch) {
+        console.log('[Instagram] Method 1: Found __additionalDataLoaded');
+        try {
+          const data = JSON.parse(additionalDataMatch[1]);
+          extractFromGraphql(data, result);
+        } catch (e) {
+          console.log('[Instagram] Method 1 parse failed:', e.message);
+        }
+      } else {
+        console.log('[Instagram] Method 1: __additionalDataLoaded not found');
+      }
+    }
+
+    // Method 2: Try window._sharedData (older but still works)
+    if (!result.url && !result.carouselItems) {
+      const sharedDataMatch = html.match(/<script type="text\/javascript">window\._sharedData\s*=\s*({.*?});<\/script>/);
+      
+      if (sharedDataMatch) {
+        console.log('[Instagram] Method 2: Found _sharedData');
+        try {
+          const sharedData = JSON.parse(sharedDataMatch[1]);
+          const postPage = sharedData?.entry_data?.PostPage?.[0];
+          
+          if (postPage) {
+            const media = postPage?.graphql?.shortcode_media || postPage?.graphql?.xdt_api__v1__media__shortcode__web_info?.items?.[0];
+            
+            if (media) {
+              console.log('[Instagram] Method 2: Extracted media from _sharedData');
+              extractFromMedia(media, result);
+            }
+          }
+        } catch (e) {
+          console.log('[Instagram] Method 2 parse failed:', e.message);
+        }
+      } else {
+        console.log('[Instagram] Method 2: _sharedData not found');
+      }
+    }
+
+    // Method 3: Try window.__INITIAL_STATE__
+    if (!result.url && !result.carouselItems) {
+      const initialStateMatch = html.match(/<script type="text\/javascript">window\.__INITIAL_STATE__\s*=\s*({.*?});<\/script>/);
+      
+      if (initialStateMatch) {
+        console.log('[Instagram] Method 3: Found __INITIAL_STATE__');
+        try {
+          const initialState = JSON.parse(initialStateMatch[1]);
+          const media = initialState?.graphql?.shortcode_media;
+          
+          if (media) {
+            console.log('[Instagram] Method 3: Extracted media from __INITIAL_STATE__');
+            extractFromMedia(media, result);
+          }
+        } catch (e) {
+          console.log('[Instagram] Method 3 parse failed:', e.message);
+        }
+      } else {
+        console.log('[Instagram] Method 3: __INITIAL_STATE__ not found');
+      }
+    }
+
+    // Method 4: Try to find data in any script tag with JSON
+    if (!result.url && !result.carouselItems) {
+      // Search for media data in any JSON embedded in the page
+      const mediaRegex = /"edge_sidecar_to_children":\{"edges":(\[.*?\])\}/;
+      const mediaMatch = html.match(mediaRegex);
+      
+      if (mediaMatch) {
+        console.log('[Instagram] Method 4: Found carousel pattern');
+        try {
+          const edges = JSON.parse(mediaMatch[1]);
+          result.isCarousel = true;
+          result.carouselItems = [];
+          
+          edges.forEach((edge) => {
+            const node = edge.node || edge;
+            if (node.display_url || node.display_resources) {
+              result.carouselItems.push({
+                type: 'image',
+                url: node.display_url || node.display_resources?.[node.display_resources.length - 1]?.src
+              });
+            } else if (node.video_url || node.video_playback_url) {
+              result.carouselItems.push({
+                type: 'video',
+                url: node.video_url || node.video_playback_url
+              });
+            }
+          });
+          
+          console.log(`[Instagram] Method 4: Found carousel with ${result.carouselItems.length} items`);
+        } catch (e) {
+          console.log('[Instagram] Method 4 parse failed:', e.message);
+        }
+      } else {
+        console.log('[Instagram] Method 4: Carousel pattern not found');
+      }
+    }
+
+    // Method 5: Regex fallback for single image
+    if (!result.url && !result.carouselItems) {
+      const imageUrls = [];
+      const imgRegex = /"display_url"\s*:\s*"([^"]+)"/g;
+      let imgMatch;
+      while ((imgMatch = imgRegex.exec(html)) !== null) {
+        const imgUrl = imgMatch[1].replace(/\\u002F/g, '/');
+        if (!imageUrls.includes(imgUrl)) {
+          imageUrls.push(imgUrl);
+        }
+      }
+      
+      if (imageUrls.length > 0) {
+        console.log('[Instagram] Method 5: Found', imageUrls.length, 'URLs via regex');
+        if (imageUrls.length === 1) {
+          result.type = 'image';
+          result.url = imageUrls[0];
+          console.log('[Instagram] Method 5: Set as single image');
+        } else {
+          result.isCarousel = true;
+          result.carouselItems = imageUrls.map(url => ({ type: 'image', url }));
+          console.log(`[Instagram] Method 5: Set as carousel with ${imageUrls.length} images`);
+        }
+      } else {
+        console.log('[Instagram] Method 5: No display_url patterns found');
+      }
+    }
+
+    // Method 6: Last resort - find any jpg/png URL that looks like Instagram CDN
+    if (!result.url && !result.carouselItems) {
+      const cdnRegex = /https:\/\/scontent[^"]+\.(jpg|jpeg|png|webp)[^"]*/g;
+      const cdnMatches = html.match(cdnRegex);
+      
+      if (cdnMatches && cdnMatches.length > 0) {
+        console.log('[Instagram] Method 6: Found', cdnMatches.length, 'CDN URLs');
+        // Filter out thumbnails and profile pics (they're usually smaller)
+        const fullSizeImages = cdnMatches.filter(url => url.includes('nc0_mxd') || url.includes('stp=') || url.includes('e35'));
+        
+        if (fullSizeImages.length > 0) {
+          console.log('[Instagram] Method 6: Filtered to', fullSizeImages.length, 'full-size images');
+          if (fullSizeImages.length === 1) {
+            result.type = 'image';
+            result.url = fullSizeImages[0];
+          } else {
+            result.isCarousel = true;
+            result.carouselItems = fullSizeImages.map(url => ({ type: 'image', url }));
+          }
+          console.log(`[Instagram] Method 6: Set result`);
+        } else {
+          console.log('[Instagram] Method 6: No full-size images found after filtering');
+        }
+      } else {
+        console.log('[Instagram] Method 6: No CDN URLs found');
+      }
+    }
+
+    // Method 7: Try extracting from any script tag with JSON containing media data
+    if (!result.url && !result.carouselItems) {
+      console.log('[Instagram] Method 7: Searching for JSON in script tags...');
+      try {
+        // Look for script tags with type application/json
+        const scriptRegex = /<script[^>]*type="application\/json"[^>]*>([^<]+)<\/script>/g;
+        let scriptMatch;
+        while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+          try {
+            const data = JSON.parse(scriptMatch[1]);
+            if (data.data && data.data.shortcode_media) {
+              console.log('[Instagram] Method 7: Found shortcode_media in script tag');
+              extractFromMedia(data.data.shortcode_media, result);
+              break;
+            }
+            if (data.__typename && (data.__typename.includes('GraphImage') || data.__typename.includes('GraphVideo'))) {
+              console.log('[Instagram] Method 7: Found GraphImage/GraphVideo in script tag');
+              extractFromMedia(data, result);
+              break;
+            }
+          } catch (e) {
+            // Skip this script tag
+          }
+        }
+      } catch (e) {
+        console.log('[Instagram] Method 7 error:', e.message);
+      }
+    }
+
+    // Method 8: Find ANY scontent URL (more aggressive fallback)
+    if (!result.url && !result.carouselItems) {
+      console.log('[Instagram] Method 8: Searching for ANY scontent URLs...');
+      const allCdnUrls = [];
+      const cdnRegex = /https:\/\/scontent[^"'\s<>]+/g;
+      let cdnMatch;
+      while ((cdnMatch = cdnRegex.exec(html)) !== null) {
+        const url = cdnMatch[0];
+        if (url.includes('jpg') || url.includes('png') || url.includes('webp') || url.includes('mp4')) {
+          allCdnUrls.push(url);
+        }
+      }
+      
+      if (allCdnUrls.length > 0) {
+        console.log('[Instagram] Method 8: Found', allCdnUrls.length, 'CDN URLs');
+        // Try to get the first one that's not too small (likely not a thumbnail)
+        const firstUrl = allCdnUrls[0];
+        if (firstUrl) {
+          result.type = 'image';
+          result.url = firstUrl;
+          console.log('[Instagram] Method 8: Using first CDN URL');
+        }
+      } else {
+        console.log('[Instagram] Method 8: No scontent URLs found');
+      }
+    }
+
+    console.log('[Instagram] Final result - URL:', !!result.url, 'Carousel:', !!result.carouselItems, 'Type:', result.type);
+    resolve(result);
+  } catch (e) {
+    console.error('[Instagram] Parse error:', e.message);
+    reject(new Error('Failed to parse Instagram content'));
+  }
+}
+
+// Helper: Extract data from GraphQL response
+function extractFromGraphql(data, result) {
+  try {
+    // Navigate through the data structure
+    const shortcode = Object.keys(data).find(key => key.includes('shortcode'));
+    
+    if (shortcode) {
+      const item = data[shortcode];
+      const media = item?.data?.xdt_shortcode_media || item?.data?.shortcode_media;
+      
+      if (media) {
+        extractFromMedia(media, result);
+      }
+    }
+  } catch (e) {
+    console.log('[Instagram] extractFromGraphql error:', e.message);
+  }
+}
+
+// Helper: Extract data from media object
+function extractFromMedia(media, result) {
+  try {
+    if (!media) return;
+
+    // Extract title and author
+    if (media.caption) {
+      result.title = media.caption.text || media.caption.text || result.title;
+    }
+    
+    if (media.owner) {
+      result.uploader = media.owner.username || result.uploader;
+    } else if (media.user) {
+      result.uploader = media.user.username || result.uploader;
+    } else if (media.author) {
+      result.uploader = media.author.username || result.uploader;
+    }
+
+    // Check if it's a carousel (multiple images/videos)
+    if (media.edge_sidecar_to_children?.edges) {
+      const edges = media.edge_sidecar_to_children.edges;
+      result.isCarousel = true;
+      result.carouselItems = [];
+      
+      edges.forEach((edge) => {
+        const node = edge.node || edge;
+        const typename = node.__typename || '';
+        
+        if (typename.includes('Image') || node.display_url) {
+          result.carouselItems.push({
+            type: 'image',
+            url: node.display_url || node.display_resources?.[node.display_resources.length - 1]?.src
+          });
+        } else if (typename.includes('Video') || node.video_url) {
+          result.carouselItems.push({
+            type: 'video',
+            url: node.video_url || node.video_playback_url
+          });
+        }
+      });
+      
+      console.log(`[Instagram] Found carousel with ${result.carouselItems.length} items`);
+    }
+    // Single image
+    else if (media.display_url) {
+      result.type = 'image';
+      result.url = media.display_url || media.display_resources?.[media.display_resources.length - 1]?.src;
+      console.log('[Instagram] Found single image');
+    }
+    // Video
+    else if (media.video_url || media.video_playback_url) {
+      result.type = 'video';
+      result.url = media.video_url || media.video_playback_url;
+      result.duration = media.video_duration;
+      console.log('[Instagram] Found video');
+    }
+  } catch (e) {
+    console.log('[Instagram] extractFromMedia error:', e.message);
+  }
+}
+
 // Helper: Get info from any supported platform
 function getMediaInfo(url, platform = 'youtube') {
   return new Promise((resolve, reject) => {
     // If platform is unknown, it's likely a search or a link that should use YouTube args as fallback
     const args = (platform === 'youtube' || platform === 'unknown') ? buildYoutubeDlpArgs() : buildSocialDlpArgs();
     console.log(`[yt-dlp] Fetching info for ${platform} using args: ${args}`);
-    
+
     // Use --no-warnings to keep stdout clean, and ensure we use the built args
     exec(`yt-dlp ${args} --dump-json "${url}"`, (error, stdout, stderr) => {
       if (error) {
@@ -875,44 +1670,90 @@ function searchYouTube(query, maxResults = 10) {
 }
 
 // Helper: Download video with specific quality
-function downloadVideoFile(url, quality, outputPath) {
-  return new Promise((resolve, reject) => {
-    const ytQualityMap = {
-      '144': '144',
-      '240': '240',
-      '360': '360',
-      '480': '480',
-      '720': '720',
-      '1080': '1080'
-    };
-    const h = ytQualityMap[quality] || '720';
+async function downloadVideoFile(url, quality, outputPath) {
+  const ytQualityMap = {
+    '144': '144',
+    '240': '240',
+    '360': '360',
+    '480': '480',
+    '720': '720',
+    '1080': '1080'
+  };
+  const h = ytQualityMap[quality] || '720';
 
-    // Use -f to select best video+audio with max height h
-    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
+  // Use -f to select best video+audio with max height h
+  const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
 
-    exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
+  try {
+    await new Promise((resolve, reject) => {
+      exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    // If cookies error, refresh and retry once
+    if (isYouTubeCookiesInvalidError(error) || isYouTubeBotChallengeError(error)) {
+      console.log('[YouTube] Cookie error during download, refreshing...');
+      await refreshYouTubeCookies();
+      
+      // Retry once
+      const cmd2 = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
+      
+      await new Promise((resolve, reject) => {
+        exec(cmd2, { maxBuffer: 1024 * 1024 * 50 }, (error2, stdout2, stderr2) => {
+          if (error2) {
+            reject(error2);
+            return;
+          }
+          resolve();
+        });
+      });
+    } else {
+      throw error;
+    }
+  }
 }
 
 // Helper: Download audio only
-function downloadAudioFile(url, outputPath) {
-  return new Promise((resolve, reject) => {
+async function downloadAudioFile(url, outputPath) {
+  try {
     const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -x --audio-format mp3 -o "${outputPath}" "${url}"`;
 
-    exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
+    await new Promise((resolve, reject) => {
+      exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    // If cookies error, refresh and retry once
+    if (isYouTubeCookiesInvalidError(error) || isYouTubeBotChallengeError(error)) {
+      console.log('[YouTube] Cookie error during audio download, refreshing...');
+      await refreshYouTubeCookies();
+      
+      // Retry once
+      const cmd2 = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -x --audio-format mp3 -o "${outputPath}" "${url}"`;
+      
+      await new Promise((resolve, reject) => {
+        exec(cmd2, { maxBuffer: 1024 * 1024 * 50 }, (error2, stdout2, stderr2) => {
+          if (error2) {
+            reject(error2);
+            return;
+          }
+          resolve();
+        });
+      });
+    } else {
+      throw error;
+    }
+  }
 }
 
 // Helper: Upload video with progress (send directly from local file - faster)
@@ -1357,77 +2198,227 @@ bot.on('message', async (msg) => {
   if (platform === 'instagram') {
     try {
       bot.sendChatAction(chatId, 'typing');
-      const info = await getMediaInfo(text, 'instagram');
-      
+      const info = await getInstagramInfo(text);
+
       const title = info.title || 'بدون عنوان';
+      const author = info.uploader || 'انستجرام';
+
+      // Check if extraction failed
+      const hasData = info.url || info.carouselItems || info.type === 'video' || info.type === 'image';
+      
+      if (!hasData) {
+        bot.sendMessage(chatId, '❌ تعذر استخراج البيانات من انستجرام.\n\n💡 الأسباب المحتملة:\n• الحساب خاص وليس عام\n• البوست محذوف\n• الكوكيز منتهية الصلاحية\n\n🔄 حاول تحديث ملف الكوكيز أو أرسل رابط بوست عام آخر.');
+        return;
+      }
 
       const statusMsg = await bot.sendMessage(chatId, `⬇️ *جاري التحميل من انستجرام...*\n\n📌 ${title.substring(0, 80)}`, { parse_mode: 'Markdown' });
 
-      const safeFilename = title.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 60);
-      const ext = info.ext || 'mp4';
-      const outputPath = path.join(DOWNLOAD_DIR, `${safeFilename}.${ext}`);
-
       try {
-        await downloadMediaFile(text, outputPath, 'instagram');
-      } catch (error) {
-        console.error('Instagram download error:', error);
-        bot.editMessageText('❌ خطأ أثناء التحميل. تأكد أن المنشور عام وليس خاص.', {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: 'Markdown'
-        });
-        return;
-      }
+        // Check if it's a carousel (multiple images/videos)
+        const isCarousel = info.isCarousel || (info.carouselItems && info.carouselItems.length > 0);
+        
+        if (isCarousel) {
+          // Handle carousel - download each item
+          const downloadedFiles = [];
+          
+          for (let i = 0; i < info.carouselItems.length; i++) {
+            const item = info.carouselItems[i];
+            const ext = item.type === 'video' ? 'mp4' : 'jpg';
+            const safeFilename = `insta_${item.type}_${Date.now()}_${i}.${ext}`;
+            const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
 
-      if (!fs.existsSync(outputPath)) {
-        bot.editMessageText('❌ فشل التحميل.', {
-          chat_id: chatId,
-          message_id: statusMsg.message_id
-        });
-        return;
-      }
+            try {
+              await downloadImage(item.url, outputPath);
+              if (fs.existsSync(outputPath)) {
+                downloadedFiles.push({ path: outputPath, type: item.type });
+              }
+            } catch (err) {
+              console.error(`Failed to download carousel item ${i}:`, err.message);
+            }
+          }
 
-      const fileStats = fs.statSync(outputPath);
-      if (fileStats.size > 50 * 1024 * 1024) {
-        bot.editMessageText('❌ الملف كبير جداً! الحد: 50 ميجابايت.', {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: 'Markdown'
-        });
-        fs.unlinkSync(outputPath);
-        return;
-      }
+          if (downloadedFiles.length === 0) {
+            throw new Error('No carousel items found');
+          }
 
-      await bot.editMessageText('⬆️ *جاري الإرسال...* 📤', {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        parse_mode: 'Markdown'
-      });
-
-      try {
-        if (ext === 'mp4' || ext === 'mov') {
-          await bot.sendVideo(chatId, outputPath, {
-            caption: `📸 ${title.substring(0, 100)}\n📦 ${formatBytes(fileStats.size)}`,
+          await bot.editMessageText('⬆️ *جاري الإرسال...* 📤', {
+            chat_id: chatId,
+            message_id: statusMsg.message_id,
             parse_mode: 'Markdown'
           });
-        } else {
-          await bot.sendDocument(chatId, outputPath, {
-            caption: `📸 ${title.substring(0, 100)}\n📦 ${formatBytes(fileStats.size)}`,
+
+          // Send each item
+          for (let i = 0; i < downloadedFiles.length; i++) {
+            const file = downloadedFiles[i];
+            const caption = i === 0 ? `📸 ${title.substring(0, 100)}\n👤 ${author}\n📊 ${downloadedFiles.length} صور/فيديو` : undefined;
+            
+            if (file.type === 'video') {
+              await bot.sendVideo(chatId, file.path, { caption });
+            } else {
+              await bot.sendPhoto(chatId, file.path, { caption });
+            }
+          }
+
+          stats.totalDownloads++;
+          saveStats();
+
+          // Cleanup
+          downloadedFiles.forEach((file) => {
+            if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+          });
+
+        } else if (info.type === 'image' || info.ext === 'jpg' || info.ext === 'jpeg') {
+          // Handle single image
+          const safeFilename = `insta_photo_${Date.now()}.jpg`;
+          const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
+
+          try {
+            await downloadImage(info.url, outputPath);
+          } catch (error) {
+            console.error('Instagram image download error:', error);
+            bot.editMessageText('❌ خطأ أثناء التحميل.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id,
+              parse_mode: 'Markdown'
+            });
+            return;
+          }
+
+          if (!fs.existsSync(outputPath)) {
+            bot.editMessageText('❌ فشل التحميل.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id
+            });
+            return;
+          }
+
+          const fileStats = fs.statSync(outputPath);
+          if (fileStats.size > 50 * 1024 * 1024) {
+            bot.editMessageText('❌ الملف كبير جداً! الحد: 50 ميجابايت.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id,
+              parse_mode: 'Markdown'
+            });
+            fs.unlinkSync(outputPath);
+            return;
+          }
+
+          await bot.editMessageText('⬆️ *جاري الإرسال...* 📤', {
+            chat_id: chatId,
+            message_id: statusMsg.message_id,
             parse_mode: 'Markdown'
           });
+
+          try {
+            await bot.sendPhoto(chatId, outputPath, {
+              caption: `📸 ${title.substring(0, 100)}\n👤 ${author}\n📦 ${formatBytes(fileStats.size)}`,
+              parse_mode: 'Markdown'
+            });
+
+            stats.totalDownloads++;
+            saveStats();
+          } catch (uploadError) {
+            console.error('Instagram upload error:', uploadError);
+            bot.editMessageText('❌ خطأ أثناء الإرسال.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id
+            });
+          }
+
+          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+
+        } else if (info.type === 'video') {
+          // Handle video (use yt-dlp only if it already succeeded)
+          const safeFilename = title.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 60);
+          const ext = info.ext || 'mp4';
+          const outputPath = path.join(DOWNLOAD_DIR, `${safeFilename}.${ext}`);
+
+          // If yt-dlp already gave us info, use it
+          if (info.url) {
+            // Download directly from URL
+            try {
+              await downloadImage(info.url, outputPath);
+            } catch (error) {
+              console.error('Instagram video download error:', error);
+              bot.editMessageText('❌ خطأ أثناء التحميل.', {
+                chat_id: chatId,
+                message_id: statusMsg.message_id,
+                parse_mode: 'Markdown'
+              });
+              return;
+            }
+          } else {
+            // Need to use yt-dlp
+            try {
+              await downloadMediaFile(text, outputPath, 'instagram');
+            } catch (error) {
+              console.error('Instagram download error:', error);
+              bot.editMessageText('❌ خطأ أثناء التحميل. تأكد أن المنشور عام وليس خاص.', {
+                chat_id: chatId,
+                message_id: statusMsg.message_id,
+                parse_mode: 'Markdown'
+              });
+              return;
+            }
+          }
+
+          if (!fs.existsSync(outputPath)) {
+            bot.editMessageText('❌ فشل التحميل.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id
+            });
+            return;
+          }
+
+          const fileStats = fs.statSync(outputPath);
+          if (fileStats.size > 50 * 1024 * 1024) {
+            bot.editMessageText('❌ الملف كبير جداً! الحد: 50 ميجابايت.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id,
+              parse_mode: 'Markdown'
+            });
+            fs.unlinkSync(outputPath);
+            return;
+          }
+
+          await bot.editMessageText('⬆️ *جاري الإرسال...* 📤', {
+            chat_id: chatId,
+            message_id: statusMsg.message_id,
+            parse_mode: 'Markdown'
+          });
+
+          try {
+            if (ext === 'mp4' || ext === 'mov') {
+              await bot.sendVideo(chatId, outputPath, {
+                caption: `📸 ${title.substring(0, 100)}\n👤 ${author}\n📦 ${formatBytes(fileStats.size)}`,
+                parse_mode: 'Markdown'
+              });
+            } else {
+              await bot.sendDocument(chatId, outputPath, {
+                caption: `📸 ${title.substring(0, 100)}\n👤 ${author}\n📦 ${formatBytes(fileStats.size)}`,
+                parse_mode: 'Markdown'
+              });
+            }
+
+            stats.totalDownloads++;
+            saveStats();
+          } catch (uploadError) {
+            console.error('Instagram upload error:', uploadError);
+            bot.editMessageText('❌ خطأ أثناء الإرسال.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id
+            });
+          }
+
+          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
         }
-
-        stats.totalDownloads++;
-        saveStats();
-      } catch (uploadError) {
-        console.error('Instagram upload error:', uploadError);
-        bot.editMessageText('❌ خطأ أثناء الإرسال.', {
+      } catch (downloadError) {
+        console.error('Instagram download/upload error:', downloadError);
+        bot.editMessageText('❌ خطأ أثناء التحميل أو الإرسال.', {
           chat_id: chatId,
           message_id: statusMsg.message_id
         });
       }
-
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
 
     } catch (error) {
       console.error('Instagram error:', error);
@@ -1440,139 +2431,55 @@ bot.on('message', async (msg) => {
   if (platform === 'tiktok') {
     try {
       bot.sendChatAction(chatId, 'typing');
-      const info = await getMediaInfo(text, 'tiktok');
+      
+      // Use the new getTikTokInfo function which has fallback
+      const info = await getTikTokInfo(text);
 
       const title = info.title || 'بدون عنوان';
       const author = info.uploader || info.channel || 'تيك توك';
 
-      // Check if it's a photo/slideshow (TikTok photo posts)
-      const isPhoto = info.ext && ['jpg', 'jpeg', 'png', 'webp'].includes(info.ext.toLowerCase());
-      const isSlideshow = (info.entries && info.entries.length > 0) || 
-                          (info.formats && info.formats.some(f => f.ext && ['jpg', 'jpeg', 'png', 'webp'].includes(f.ext.toLowerCase())));
-      const hasImageUrl = info.url || (info.formats && info.formats.length > 0 && info.formats[0].url);
-
       const statusMsg = await bot.sendMessage(chatId, `⬇️ جاري التحميل من تيك توك...\n\n📌 ${title.substring(0, 80)}`);
 
       try {
+        // Check if it's a photo/slideshow (TikTok photo posts)
+        const isPhoto = info.type === 'photo';
+        const isSlideshow = info.isSlideshow || (info.images && info.images.length > 1);
+        const isVideo = info.type === 'video' || (!isPhoto && !isSlideshow);
+
         // Handle photo/slideshow
         if (isPhoto || isSlideshow) {
           // For TikTok photos, we need to download from the image URLs directly
           const downloadedFiles = [];
           
-          // If it's a single photo
-          if (info.url && !isSlideshow) {
-            const ext = info.ext || 'jpg';
-            const safeFilename = `tiktok_photo_${Date.now()}.${ext}`;
+          // If we have images array (slideshow)
+          if (info.images && info.images.length > 0) {
+            for (let i = 0; i < info.images.length; i++) {
+              const imageUrl = info.images[i];
+              const safeFilename = `tiktok_photo_${Date.now()}_${i}.jpg`;
+              const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
+
+              try {
+                await downloadImage(imageUrl, outputPath);
+                if (fs.existsSync(outputPath)) {
+                  downloadedFiles.push(outputPath);
+                }
+              } catch (err) {
+                console.error(`Failed to download image ${i}:`, err.message);
+              }
+            }
+          }
+          // Single photo with URL
+          else if (info.url) {
+            const safeFilename = `tiktok_photo_${Date.now()}.jpg`;
             const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
 
-            // Download photo directly
-            await new Promise((resolve, reject) => {
-              const file = fs.createWriteStream(outputPath);
-              https.get(info.url, (response) => {
-                if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                  file.close(() => fs.unlink(outputPath, () => {}));
-                  https.get(response.headers.location, (redirectResponse) => {
-                    redirectResponse.pipe(file);
-                    file.on('finish', () => {
-                      file.close(() => resolve());
-                    });
-                  }).on('error', (err) => {
-                    file.close(() => fs.unlink(outputPath, () => {}));
-                    reject(err);
-                  });
-                  return;
-                }
-                response.pipe(file);
-                file.on('finish', () => {
-                  file.close(() => resolve());
-                });
-              }).on('error', (err) => {
-                file.close(() => fs.unlink(outputPath, () => {}));
-                reject(err);
-              });
-            });
-
-            if (fs.existsSync(outputPath)) {
-              downloadedFiles.push(outputPath);
-            }
-          } else if (info.formats && info.formats.length > 0) {
-            // Multiple formats (slideshow)
-            for (let i = 0; i < info.formats.length; i++) {
-              const format = info.formats[i];
-              if (!format.url || !format.ext || !['jpg', 'jpeg', 'png', 'webp'].includes(format.ext.toLowerCase())) {
-                continue;
+            try {
+              await downloadImage(info.url, outputPath);
+              if (fs.existsSync(outputPath)) {
+                downloadedFiles.push(outputPath);
               }
-
-              const safeFilename = `tiktok_photo_${Date.now()}_${i}.${format.ext}`;
-              const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
-
-              // Download photo
-              try {
-                await new Promise((resolve, reject) => {
-                  const file = fs.createWriteStream(outputPath);
-                  https.get(format.url, (response) => {
-                    if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                      file.close(() => fs.unlink(outputPath, () => {}));
-                      https.get(response.headers.location, (redirectResponse) => {
-                        redirectResponse.pipe(file);
-                        file.on('finish', () => {
-                          file.close(() => resolve());
-                        });
-                      }).on('error', (err) => {
-                        file.close(() => fs.unlink(outputPath, () => {}));
-                        reject(err);
-                      });
-                      return;
-                    }
-                    response.pipe(file);
-                    file.on('finish', () => {
-                      file.close(() => resolve());
-                    });
-                  }).on('error', (err) => {
-                    file.close(() => fs.unlink(outputPath, () => {}));
-                    reject(err);
-                  });
-                });
-
-                if (fs.existsSync(outputPath)) {
-                  downloadedFiles.push(outputPath);
-                }
-              } catch (err) {
-                console.error(`Failed to download photo ${i}:`, err.message);
-              }
-            }
-          } else if (info.entries && info.entries.length > 0) {
-            // TikTok slideshow entries
-            for (let i = 0; i < info.entries.length; i++) {
-              const entry = info.entries[i];
-              const entryUrl = entry.url || entry.formats?.[0]?.url;
-              
-              if (!entryUrl) continue;
-
-              const ext = entry.ext || 'jpg';
-              const safeFilename = `tiktok_photo_${Date.now()}_${i}.${ext}`;
-              const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
-
-              try {
-                await new Promise((resolve, reject) => {
-                  const file = fs.createWriteStream(outputPath);
-                  https.get(entryUrl, (response) => {
-                    response.pipe(file);
-                    file.on('finish', () => {
-                      file.close(() => resolve());
-                    });
-                  }).on('error', (err) => {
-                    file.close(() => fs.unlink(outputPath, () => {}));
-                    reject(err);
-                  });
-                });
-
-                if (fs.existsSync(outputPath)) {
-                  downloadedFiles.push(outputPath);
-                }
-              } catch (err) {
-                console.error(`Failed to download entry ${i}:`, err.message);
-              }
+            } catch (err) {
+              console.error('Failed to download photo:', err.message);
             }
           }
 
@@ -1587,25 +2494,12 @@ bot.on('message', async (msg) => {
             parse_mode: 'Markdown'
           });
 
-          // Send as album if multiple photos, or single photo
-          if (downloadedFiles.length === 1) {
-            await bot.sendPhoto(chatId, downloadedFiles[0], {
-              caption: `📸 ${title.substring(0, 100)}\n👤 ${author}`
-            });
-          } else {
-            // Send as media group (album)
-            const mediaGroup = downloadedFiles.map((filePath, index) => ({
-              type: 'photo',
-              media: `attach://${path.basename(filePath)}`,
-              caption: index === 0 ? `📸 ${title.substring(0, 100)}\n👤 ${author}` : undefined
-            }));
-
-            const files = {};
-            downloadedFiles.forEach((filePath) => {
-              files[path.basename(filePath)] = fs.createReadStream(filePath);
-            });
-
-            await bot.sendMediaGroup(chatId, mediaGroup, { files });
+          // Send each photo individually
+          for (let i = 0; i < downloadedFiles.length; i++) {
+            const filePath = downloadedFiles[i];
+            const caption = i === 0 ? `📸 ${title.substring(0, 100)}\n👤 ${author}` : undefined;
+            
+            await bot.sendPhoto(chatId, filePath, { caption });
           }
 
           stats.totalDownloads++;
@@ -1616,8 +2510,8 @@ bot.on('message', async (msg) => {
             if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
           });
 
-        } else {
-          // Handle video (existing logic)
+        } else if (isVideo) {
+          // Handle video (use yt-dlp)
           const safeFilename = title.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 60);
           const outputPath = path.join(DOWNLOAD_DIR, `${safeFilename}.mp4`);
 
@@ -1752,8 +2646,31 @@ bot.on('message', async (msg) => {
     // Send typing indicator
     bot.sendChatAction(chatId, 'typing');
 
-    // Get video info
-    const info = await getVideoInfo(text);
+    // Get video info with retry on cookie failure
+    let info;
+    try {
+      info = await getVideoInfo(text);
+    } catch (error) {
+      // Check if it's a cookies issue
+      if (isYouTubeCookiesInvalidError(error) || isYouTubeBotChallengeError(error)) {
+        console.log('[YouTube] Cookies invalid, attempting refresh...');
+        const refreshed = await refreshYouTubeCookies();
+        
+        if (refreshed) {
+          // Retry with fresh cookies
+          try {
+            info = await getVideoInfo(text);
+            console.log('[YouTube] Retry succeeded with fresh cookies!');
+          } catch (retryError) {
+            throw new Error('فشل التحديث حتى بعد تحديث الكوكيز. الكوكيز تحتاج تحديث من المتصفح.');
+          }
+        } else {
+          throw new Error('فشل تحديث الكوكيز. تأكد من رابط الكوكيز في المتغيرات.');
+        }
+      } else {
+        throw error;
+      }
+    }
 
     // Check video length (max 20 minutes)
     const duration = parseInt(info.duration || 0);
@@ -1978,6 +2895,24 @@ bot.on('callback_query', async (callbackQuery) => {
       await downloadVideo(chatId, url, quality);
     } catch (error) {
       console.error('Download error:', error);
+      
+      // Retry with fresh cookies if cookie error
+      if (isYouTubeCookiesInvalidError(error) || isYouTubeBotChallengeError(error)) {
+        console.log('[YouTube] Cookies invalid during download, refreshing...');
+        const refreshed = await refreshYouTubeCookies();
+        
+        if (refreshed) {
+          try {
+            console.log('[YouTube] Retrying download with fresh cookies...');
+            bot.sendChatAction(chatId, 'upload_video');
+            await downloadVideo(chatId, url, quality);
+            return;
+          } catch (retryError) {
+            console.error('Retry also failed:', retryError);
+          }
+        }
+      }
+      
       bot.sendMessage(chatId, `❌ ${getFriendlyVideoError(error)}`);
     }
   } else if (data.startsWith('audio_')) {
@@ -1991,6 +2926,25 @@ bot.on('callback_query', async (callbackQuery) => {
       await downloadAudio(chatId, url, info);
     } catch (error) {
       console.error('Audio download error:', error);
+      
+      // Retry with fresh cookies if cookie error
+      if (isYouTubeCookiesInvalidError(error) || isYouTubeBotChallengeError(error)) {
+        console.log('[YouTube] Cookies invalid during audio download, refreshing...');
+        const refreshed = await refreshYouTubeCookies();
+        
+        if (refreshed) {
+          try {
+            console.log('[YouTube] Retrying audio download with fresh cookies...');
+            bot.sendChatAction(chatId, 'upload_voice');
+            const info = await getVideoInfo(url);
+            await downloadAudio(chatId, url, info);
+            return;
+          } catch (retryError) {
+            console.error('Audio retry also failed:', retryError);
+          }
+        }
+      }
+      
       bot.sendMessage(chatId, `❌ ${getFriendlyVideoError(error)}`);
     }
   }
