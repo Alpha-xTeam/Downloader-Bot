@@ -295,7 +295,7 @@ function buildYoutubeDlpArgs(extraArgs = '') {
   // Always check current variable value which is updated at startup
   const baseArgs = [
     buildYtDlpBaseArgs(resolveCookiesFile('youtube')),
-    '--extractor-args "youtube:player_client=web"',
+    '--extractor-args "youtube:player_client=web;node_skip_verification=1"',
     '--remote-components ejs:github',
     '--js-runtimes node',
     '--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"'
