@@ -14,6 +14,11 @@ if (FFMPEG_PATH) {
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'downloader-bot-media';
+const GLOBAL_COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || '';
+const YOUTUBE_COOKIES_URL = process.env.YTDLP_YOUTUBE_COOKIES_URL || 'https://dkdxufqgmhigfhnkisdt.supabase.co/storage/v1/object/public/downloader-bot-media/cookies.txt';
+const SOCIAL_COOKIES_URL = process.env.YTDLP_SOCIAL_COOKIES_URL || 'https://dkdxufqgmhigfhnkisdt.supabase.co/storage/v1/object/public/downloader-bot-media/cookies2.txt';
+let YOUTUBE_COOKIES_FILE = process.env.YTDLP_YOUTUBE_COOKIES_FILE || (fs.existsSync(path.join(__dirname, 'cookies.txt')) ? path.join(__dirname, 'cookies.txt') : GLOBAL_COOKIES_FILE);
+let SOCIAL_COOKIES_FILE = process.env.YTDLP_SOCIAL_COOKIES_FILE || (fs.existsSync(path.join(__dirname, 'cookies2.txt')) ? path.join(__dirname, 'cookies2.txt') : GLOBAL_COOKIES_FILE);
 const HAS_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
 // Token must come from the runtime environment.
@@ -21,7 +26,7 @@ const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) {
   throw new Error('BOT_TOKEN is required');
 }
-const bot = new TelegramBot(TOKEN, { polling: true });
+const bot = new TelegramBot(TOKEN, { polling: false });
 
 // Admin ID
 const ADMIN_ID = 949712684;
@@ -200,6 +205,53 @@ function supabaseRequest(endpoint, { method = 'GET', query = '', body = null, pr
   });
 }
 
+function buildYtDlpBaseArgs(cookiesFile = '') {
+  const args = ['--no-playlist'];
+
+  if (cookiesFile) {
+    args.push(`--cookies "${cookiesFile}"`);
+  }
+
+  return args.join(' ');
+}
+
+function buildYoutubeDlpArgs(extraArgs = '') {
+  const baseArgs = [
+    buildYtDlpBaseArgs(YOUTUBE_COOKIES_FILE),
+    '--extractor-args "youtube:player_client=android,web"',
+    '--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"'
+  ];
+
+  if (extraArgs) {
+    baseArgs.push(extraArgs);
+  }
+
+  return baseArgs.filter(Boolean).join(' ');
+}
+
+function buildSocialDlpArgs(extraArgs = '') {
+  const baseArgs = [buildYtDlpBaseArgs(SOCIAL_COOKIES_FILE)];
+
+  if (extraArgs) {
+    baseArgs.push(extraArgs);
+  }
+
+  return baseArgs.filter(Boolean).join(' ');
+}
+
+function isYouTubeBotChallengeError(error) {
+  const message = `${error?.message || ''} ${error?.stderr || ''} ${error?.response?.body?.description || ''}`.toLowerCase();
+  return message.includes('sign in to confirm you\'re not a bot') || message.includes('precondition check failed') || message.includes('http error 400: bad request');
+}
+
+function getFriendlyVideoError(error) {
+  if (isYouTubeBotChallengeError(error)) {
+    return 'YouTube منع الطلب من السيرفر. استخدم cookies لليوتيوب عبر `YTDLP_YOUTUBE_COOKIES_URL` أو ملف محلي ثم أعد المحاولة.';
+  }
+
+  return 'تعذر جلب الفيديو من YouTube الآن. حاول مرة أخرى لاحقًا أو استخدم فيديو آخر.';
+}
+
 function supabaseStorageRequest(endpointPath, { method = 'GET', body = null, contentType = '', extraHeaders = {} } = {}) {
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(SUPABASE_URL);
@@ -218,6 +270,62 @@ function supabaseStorageRequest(endpointPath, { method = 'GET', body = null, con
 
     if (body !== null) {
       requestOptions.headers['Content-Type'] = contentType || 'application/octet-stream';
+
+  function downloadTextFromUrl(url, targetPath) {
+    return new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(targetPath);
+
+      const request = https.get(url, (response) => {
+        if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+          file.close(() => fs.unlink(targetPath, () => {}));
+          resolve(downloadTextFromUrl(response.headers.location, targetPath));
+          return;
+        }
+
+        if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+          file.close(() => fs.unlink(targetPath, () => {}));
+          reject(new Error(`Failed to download file from ${url} (status ${response.statusCode || 'unknown'})`));
+          return;
+        }
+
+        response.pipe(file);
+        file.on('finish', () => {
+          file.close(() => resolve(targetPath));
+        });
+      });
+
+      request.on('error', (error) => {
+        file.close(() => fs.unlink(targetPath, () => {}));
+        reject(error);
+      });
+
+      file.on('error', (error) => {
+        file.close(() => fs.unlink(targetPath, () => {}));
+        reject(error);
+      });
+    });
+  }
+
+  async function prepareCookiesFile(existingFile, remoteUrl, runtimeName) {
+    if (existingFile && fs.existsSync(existingFile)) {
+      return existingFile;
+    }
+
+    if (!remoteUrl) {
+      return '';
+    }
+
+    const runtimeDir = path.join(__dirname, '.runtime');
+    if (!fs.existsSync(runtimeDir)) {
+      fs.mkdirSync(runtimeDir, { recursive: true });
+    }
+
+    const runtimePath = path.join(runtimeDir, runtimeName);
+    console.log(`[Cookies] Downloading cookies from ${remoteUrl} to ${runtimePath}`);
+    await downloadTextFromUrl(remoteUrl, runtimePath);
+    console.log(`[Cookies] Downloaded successfully: ${runtimePath}`);
+    return runtimePath;
+  }
       requestOptions.headers['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(body);
     }
 
@@ -503,10 +611,16 @@ function isTikTokUrl(url) {
 }
 
 // Helper: Get info from any supported platform
-function getMediaInfo(url) {
+function getMediaInfo(url, platform = 'youtube') {
   return new Promise((resolve, reject) => {
-    exec(`yt-dlp --dump-json --no-playlist "${url}"`, (error, stdout, stderr) => {
+    // If platform is unknown, it's likely a search or a link that should use YouTube args as fallback
+    const args = (platform === 'youtube' || platform === 'unknown') ? buildYoutubeDlpArgs() : buildSocialDlpArgs();
+    console.log(`[yt-dlp] Fetching info for ${platform} using args: ${args}`);
+    
+    // Use --no-warnings to keep stdout clean, and ensure we use the built args
+    exec(`yt-dlp ${args} --dump-json "${url}"`, (error, stdout, stderr) => {
       if (error) {
+        console.error(`[yt-dlp] Error fetching info: ${stderr}`);
         reject(error);
         return;
       }
@@ -520,9 +634,10 @@ function getMediaInfo(url) {
 }
 
 // Helper: Download from any supported platform
-function downloadMediaFile(url, outputPath) {
+function downloadMediaFile(url, outputPath, platform = 'youtube') {
   return new Promise((resolve, reject) => {
-    const cmd = `yt-dlp --no-playlist --concurrent-fragments 8 -f "best" -o "${outputPath}" "${url}"`;
+    const args = platform === 'youtube' ? buildYoutubeDlpArgs('--concurrent-fragments 8') : buildSocialDlpArgs('--concurrent-fragments 8');
+    const cmd = `yt-dlp ${args} -f "best" -o "${outputPath}" "${url}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       if (error) {
@@ -556,26 +671,14 @@ function formatDuration(seconds) {
 
 // Helper: Get video info using yt-dlp
 function getVideoInfo(url) {
-  return new Promise((resolve, reject) => {
-    exec(`yt-dlp --dump-json --no-playlist "${url}"`, (error, stdout, stderr) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      try {
-        resolve(JSON.parse(stdout));
-      } catch (e) {
-        reject(e);
-      }
-    });
-  });
+  return getMediaInfo(url, 'youtube');
 }
 
 // Helper: Search YouTube using yt-dlp
 function searchYouTube(query, maxResults = 10) {
   return new Promise((resolve, reject) => {
     // Use --dump-json with --flat-playlist for reliable Unicode support
-    const cmd = `yt-dlp --flat-playlist --no-download --dump-json "ytsearch${maxResults}:${query}"`;
+    const cmd = `yt-dlp ${buildYoutubeDlpArgs()} --flat-playlist --no-download --dump-json "ytsearch${maxResults}:${query}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
       if (error) {
@@ -637,7 +740,7 @@ function downloadVideoFile(url, quality, outputPath) {
     const h = ytQualityMap[quality] || '720';
 
     // Use -f to select best video+audio with max height h
-    const cmd = `yt-dlp --no-playlist --concurrent-fragments 8 -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
+    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       if (error) {
@@ -652,7 +755,7 @@ function downloadVideoFile(url, quality, outputPath) {
 // Helper: Download audio only
 function downloadAudioFile(url, outputPath) {
   return new Promise((resolve, reject) => {
-    const cmd = `yt-dlp --no-playlist --concurrent-fragments 8 -x --audio-format mp3 -o "${outputPath}" "${url}"`;
+    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -x --audio-format mp3 -o "${outputPath}" "${url}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       if (error) {
@@ -1064,11 +1167,9 @@ bot.on('message', async (msg) => {
   if (platform === 'instagram') {
     try {
       bot.sendChatAction(chatId, 'typing');
-      const info = await getMediaInfo(text);
+      const info = await getMediaInfo(text, 'instagram');
       
-      const thumbnail = info.thumbnail || '';
       const title = info.title || 'بدون عنوان';
-      const duration = info.duration || 0;
 
       const statusMsg = await bot.sendMessage(chatId, `⬇️ *جاري التحميل من انستجرام...*\n\n📌 ${title.substring(0, 80)}`, { parse_mode: 'Markdown' });
 
@@ -1077,7 +1178,7 @@ bot.on('message', async (msg) => {
       const outputPath = path.join(DOWNLOAD_DIR, `${safeFilename}.${ext}`);
 
       try {
-        await downloadMediaFile(text, outputPath);
+        await downloadMediaFile(text, outputPath, 'instagram');
       } catch (error) {
         console.error('Instagram download error:', error);
         bot.editMessageText('❌ خطأ أثناء التحميل. تأكد أن المنشور عام وليس خاص.', {
@@ -1149,12 +1250,10 @@ bot.on('message', async (msg) => {
   if (platform === 'tiktok') {
     try {
       bot.sendChatAction(chatId, 'typing');
-      const info = await getMediaInfo(text);
+      const info = await getMediaInfo(text, 'tiktok');
       
-      const thumbnail = info.thumbnail || '';
       const title = info.title || 'بدون عنوان';
       const author = info.uploader || info.channel || 'تيك توك';
-      const duration = info.duration || 0;
 
       const statusMsg = await bot.sendMessage(chatId, `⬇️ جاري التحميل من تيك توك...\n\n📌 ${title.substring(0, 80)}`);
 
@@ -1162,7 +1261,7 @@ bot.on('message', async (msg) => {
       const outputPath = path.join(DOWNLOAD_DIR, `${safeFilename}.mp4`);
 
       try {
-        await downloadMediaFile(text, outputPath);
+        await downloadMediaFile(text, outputPath, 'tiktok');
       } catch (error) {
         console.error('TikTok download error:', error);
         bot.editMessageText('❌ خطأ أثناء التحميل. تأكد أن الفيديو عام.', {
@@ -1351,7 +1450,7 @@ bot.on('message', async (msg) => {
 
   } catch (error) {
     console.error('Error:', error);
-    bot.sendMessage(chatId, '❌ خطأ في جلب معلومات الفيديو. تأكد من أن الفيديو متاح وغير محظور في منطقتك.');
+    bot.sendMessage(chatId, `❌ ${getFriendlyVideoError(error)}`);
   }
 });
 
@@ -1503,7 +1602,7 @@ bot.on('callback_query', async (callbackQuery) => {
       await downloadVideo(chatId, url, quality);
     } catch (error) {
       console.error('Download error:', error);
-      bot.sendMessage(chatId, '❌ خطأ في تحميل الفيديو. يرجى المحاولة مرة أخرى.');
+      bot.sendMessage(chatId, `❌ ${getFriendlyVideoError(error)}`);
     }
   } else if (data.startsWith('audio_')) {
     const url = data.replace('audio_', '');
@@ -1516,7 +1615,7 @@ bot.on('callback_query', async (callbackQuery) => {
       await downloadAudio(chatId, url, info);
     } catch (error) {
       console.error('Audio download error:', error);
-      bot.sendMessage(chatId, '❌ خطأ في تحميل الصوت. يرجى المحاولة مرة أخرى.');
+      bot.sendMessage(chatId, `❌ ${getFriendlyVideoError(error)}`);
     }
   }
 });
@@ -1630,8 +1729,32 @@ async function downloadAudio(chatId, url, videoDetails) {
 
 // Handle errors
 bot.on('polling_error', (error) => {
-  console.error('Polling error:', error.code);
+  console.error('Polling error:', error.code, error.message, error.response?.body || error.response?.description || '');
 });
 
-console.log('🤖 البوت يعمل الآن...');
-console.log(`👤 معرف المطور: ${ADMIN_ID}`);
+async function startBot() {
+  try {
+    console.log('[Startup] Preparing cookies...');
+    const youtubeResult = await prepareCookiesFile(YOUTUBE_COOKIES_FILE, YOUTUBE_COOKIES_URL, 'cookies-youtube.txt');
+    const socialResult = await prepareCookiesFile(SOCIAL_COOKIES_FILE, SOCIAL_COOKIES_URL, 'cookies-social.txt');
+    
+    YOUTUBE_COOKIES_FILE = youtubeResult;
+    SOCIAL_COOKIES_FILE = socialResult;
+    
+    console.log(`[Startup] YT Cookies: ${YOUTUBE_COOKIES_FILE || 'None'}`);
+    console.log(`[Startup] Social Cookies: ${SOCIAL_COOKIES_FILE || 'None'}`);
+
+    await bot.deleteWebHook({ drop_pending_updates: true });
+  } catch (error) {
+    console.error('Webhook cleanup error:', error.message);
+  }
+
+  await bot.startPolling();
+  console.log('🤖 البوت يعمل الآن...');
+  console.log(`👤 معرف المطور: ${ADMIN_ID}`);
+}
+
+startBot().catch((error) => {
+  console.error('Bot startup failed:', error.message);
+  process.exit(1);
+});
