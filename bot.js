@@ -1441,72 +1441,251 @@ bot.on('message', async (msg) => {
     try {
       bot.sendChatAction(chatId, 'typing');
       const info = await getMediaInfo(text, 'tiktok');
-      
+
       const title = info.title || 'بدون عنوان';
       const author = info.uploader || info.channel || 'تيك توك';
 
+      // Check if it's a photo/slideshow (TikTok photo posts)
+      const isPhoto = info.ext && ['jpg', 'jpeg', 'png', 'webp'].includes(info.ext.toLowerCase());
+      const isSlideshow = (info.entries && info.entries.length > 0) || 
+                          (info.formats && info.formats.some(f => f.ext && ['jpg', 'jpeg', 'png', 'webp'].includes(f.ext.toLowerCase())));
+      const hasImageUrl = info.url || (info.formats && info.formats.length > 0 && info.formats[0].url);
+
       const statusMsg = await bot.sendMessage(chatId, `⬇️ جاري التحميل من تيك توك...\n\n📌 ${title.substring(0, 80)}`);
 
-      const safeFilename = title.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 60);
-      const outputPath = path.join(DOWNLOAD_DIR, `${safeFilename}.mp4`);
-
       try {
-        await downloadMediaFile(text, outputPath, 'tiktok');
-      } catch (error) {
-        console.error('TikTok download error:', error);
-        bot.editMessageText('❌ خطأ أثناء التحميل. تأكد أن الفيديو عام.', {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: 'Markdown'
-        });
-        return;
-      }
+        // Handle photo/slideshow
+        if (isPhoto || isSlideshow) {
+          // For TikTok photos, we need to download from the image URLs directly
+          const downloadedFiles = [];
+          
+          // If it's a single photo
+          if (info.url && !isSlideshow) {
+            const ext = info.ext || 'jpg';
+            const safeFilename = `tiktok_photo_${Date.now()}.${ext}`;
+            const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
 
-      if (!fs.existsSync(outputPath)) {
-        bot.editMessageText('❌ فشل التحميل.', {
+            // Download photo directly
+            await new Promise((resolve, reject) => {
+              const file = fs.createWriteStream(outputPath);
+              https.get(info.url, (response) => {
+                if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                  file.close(() => fs.unlink(outputPath, () => {}));
+                  https.get(response.headers.location, (redirectResponse) => {
+                    redirectResponse.pipe(file);
+                    file.on('finish', () => {
+                      file.close(() => resolve());
+                    });
+                  }).on('error', (err) => {
+                    file.close(() => fs.unlink(outputPath, () => {}));
+                    reject(err);
+                  });
+                  return;
+                }
+                response.pipe(file);
+                file.on('finish', () => {
+                  file.close(() => resolve());
+                });
+              }).on('error', (err) => {
+                file.close(() => fs.unlink(outputPath, () => {}));
+                reject(err);
+              });
+            });
+
+            if (fs.existsSync(outputPath)) {
+              downloadedFiles.push(outputPath);
+            }
+          } else if (info.formats && info.formats.length > 0) {
+            // Multiple formats (slideshow)
+            for (let i = 0; i < info.formats.length; i++) {
+              const format = info.formats[i];
+              if (!format.url || !format.ext || !['jpg', 'jpeg', 'png', 'webp'].includes(format.ext.toLowerCase())) {
+                continue;
+              }
+
+              const safeFilename = `tiktok_photo_${Date.now()}_${i}.${format.ext}`;
+              const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
+
+              // Download photo
+              try {
+                await new Promise((resolve, reject) => {
+                  const file = fs.createWriteStream(outputPath);
+                  https.get(format.url, (response) => {
+                    if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                      file.close(() => fs.unlink(outputPath, () => {}));
+                      https.get(response.headers.location, (redirectResponse) => {
+                        redirectResponse.pipe(file);
+                        file.on('finish', () => {
+                          file.close(() => resolve());
+                        });
+                      }).on('error', (err) => {
+                        file.close(() => fs.unlink(outputPath, () => {}));
+                        reject(err);
+                      });
+                      return;
+                    }
+                    response.pipe(file);
+                    file.on('finish', () => {
+                      file.close(() => resolve());
+                    });
+                  }).on('error', (err) => {
+                    file.close(() => fs.unlink(outputPath, () => {}));
+                    reject(err);
+                  });
+                });
+
+                if (fs.existsSync(outputPath)) {
+                  downloadedFiles.push(outputPath);
+                }
+              } catch (err) {
+                console.error(`Failed to download photo ${i}:`, err.message);
+              }
+            }
+          } else if (info.entries && info.entries.length > 0) {
+            // TikTok slideshow entries
+            for (let i = 0; i < info.entries.length; i++) {
+              const entry = info.entries[i];
+              const entryUrl = entry.url || entry.formats?.[0]?.url;
+              
+              if (!entryUrl) continue;
+
+              const ext = entry.ext || 'jpg';
+              const safeFilename = `tiktok_photo_${Date.now()}_${i}.${ext}`;
+              const outputPath = path.join(DOWNLOAD_DIR, safeFilename);
+
+              try {
+                await new Promise((resolve, reject) => {
+                  const file = fs.createWriteStream(outputPath);
+                  https.get(entryUrl, (response) => {
+                    response.pipe(file);
+                    file.on('finish', () => {
+                      file.close(() => resolve());
+                    });
+                  }).on('error', (err) => {
+                    file.close(() => fs.unlink(outputPath, () => {}));
+                    reject(err);
+                  });
+                });
+
+                if (fs.existsSync(outputPath)) {
+                  downloadedFiles.push(outputPath);
+                }
+              } catch (err) {
+                console.error(`Failed to download entry ${i}:`, err.message);
+              }
+            }
+          }
+
+          // Send photos
+          if (downloadedFiles.length === 0) {
+            throw new Error('No photos found');
+          }
+
+          await bot.editMessageText('⬆️ *جاري الإرسال...* 📤', {
+            chat_id: chatId,
+            message_id: statusMsg.message_id,
+            parse_mode: 'Markdown'
+          });
+
+          // Send as album if multiple photos, or single photo
+          if (downloadedFiles.length === 1) {
+            await bot.sendPhoto(chatId, downloadedFiles[0], {
+              caption: `📸 ${title.substring(0, 100)}\n👤 ${author}`
+            });
+          } else {
+            // Send as media group (album)
+            const mediaGroup = downloadedFiles.map((filePath, index) => ({
+              type: 'photo',
+              media: `attach://${path.basename(filePath)}`,
+              caption: index === 0 ? `📸 ${title.substring(0, 100)}\n👤 ${author}` : undefined
+            }));
+
+            const files = {};
+            downloadedFiles.forEach((filePath) => {
+              files[path.basename(filePath)] = fs.createReadStream(filePath);
+            });
+
+            await bot.sendMediaGroup(chatId, mediaGroup, { files });
+          }
+
+          stats.totalDownloads++;
+          saveStats();
+
+          // Cleanup
+          downloadedFiles.forEach((filePath) => {
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+          });
+
+        } else {
+          // Handle video (existing logic)
+          const safeFilename = title.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 60);
+          const outputPath = path.join(DOWNLOAD_DIR, `${safeFilename}.mp4`);
+
+          try {
+            await downloadMediaFile(text, outputPath, 'tiktok');
+          } catch (error) {
+            console.error('TikTok download error:', error);
+            bot.editMessageText('❌ خطأ أثناء التحميل. تأكد أن الفيديو عام.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id,
+              parse_mode: 'Markdown'
+            });
+            return;
+          }
+
+          if (!fs.existsSync(outputPath)) {
+            bot.editMessageText('❌ فشل التحميل.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id
+            });
+            return;
+          }
+
+          const fileStats = fs.statSync(outputPath);
+          if (fileStats.size > 50 * 1024 * 1024) {
+            bot.editMessageText('❌ الملف كبير جداً! الحد: 50 ميجابايت.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id,
+              parse_mode: 'Markdown'
+            });
+            fs.unlinkSync(outputPath);
+            return;
+          }
+
+          await bot.editMessageText('⬆️ *جاري الإرسال...* 📤', {
+            chat_id: chatId,
+            message_id: statusMsg.message_id,
+            parse_mode: 'Markdown'
+          });
+
+          try {
+            await bot.sendVideo(chatId, outputPath, {
+              caption: `🎵 ${title.substring(0, 100)}\n👤 ${author}\n📦 ${formatBytes(fileStats.size)}`
+            });
+
+            stats.totalDownloads++;
+            saveStats();
+          } catch (uploadError) {
+            console.error('TikTok upload error:', uploadError);
+            bot.editMessageText('❌ خطأ أثناء الإرسال.', {
+              chat_id: chatId,
+              message_id: statusMsg.message_id
+            });
+          }
+
+          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        }
+      } catch (downloadError) {
+        console.error('TikTok download/upload error:', downloadError);
+        bot.editMessageText('❌ خطأ أثناء التحميل أو الإرسال.', {
           chat_id: chatId,
           message_id: statusMsg.message_id
         });
-        return;
       }
-
-      const fileStats = fs.statSync(outputPath);
-      if (fileStats.size > 50 * 1024 * 1024) {
-        bot.editMessageText('❌ الملف كبير جداً! الحد: 50 ميجابايت.', {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: 'Markdown'
-        });
-        fs.unlinkSync(outputPath);
-        return;
-      }
-
-      await bot.editMessageText('⬆️ *جاري الإرسال...* 📤', {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        parse_mode: 'Markdown'
-      });
-
-      try {
-        await bot.sendVideo(chatId, outputPath, {
-          caption: `🎵 ${title.substring(0, 100)}\n👤 ${author}\n📦 ${formatBytes(fileStats.size)}`
-        });
-
-        stats.totalDownloads++;
-        saveStats();
-      } catch (uploadError) {
-        console.error('TikTok upload error:', uploadError);
-        bot.editMessageText('❌ خطأ أثناء الإرسال.', {
-          chat_id: chatId,
-          message_id: statusMsg.message_id
-        });
-      }
-
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
 
     } catch (error) {
       console.error('TikTok error:', error);
-      bot.sendMessage(chatId, '❌ خطأ في تحميل الفيديو. تأكد من أن الرابط صحيح والفيديو عام.');
+      bot.sendMessage(chatId, '❌ خطأ في تحميل المحتوى من تيك توك. تأكد من أن الرابط صحيح والمحتوى عام.');
     }
     return;
   }
