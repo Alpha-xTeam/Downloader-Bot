@@ -322,9 +322,18 @@ function isYouTubeBotChallengeError(error) {
   return message.includes('sign in to confirm you\'re not a bot') || message.includes('precondition check failed') || message.includes('http error 400: bad request');
 }
 
+function isYouTubeCookiesInvalidError(error) {
+  const message = `${error?.message || ''} ${error?.stderr || ''} ${error?.response?.body?.description || ''}`.toLowerCase();
+  return message.includes('cookies are no longer valid') || message.includes('have likely been rotated') || message.includes('cookie') && message.includes('rotated in the browser');
+}
+
 function getFriendlyVideoError(error) {
+  if (isYouTubeCookiesInvalidError(error)) {
+    return 'كوكيز يوتيوب منتهية أو تغيّرت في المتصفح. ارفع ملف cookies.txt جديد ومحدّث ثم أعد المحاولة.';
+  }
+
   if (isYouTubeBotChallengeError(error)) {
-    return 'YouTube منع الطلب من السيرفر. استخدم cookies لليوتيوب عبر `YTDLP_YOUTUBE_COOKIES_URL` أو ملف محلي ثم أعد المحاولة.';
+    return 'YouTube منع الطلب من السيرفر. إذا كان ملف الكوكيز قديمًا، ارفع ملف cookies.txt جديد ومحدّث ثم أعد المحاولة.';
   }
 
   return 'تعذر جلب الفيديو من YouTube الآن. حاول مرة أخرى لاحقًا أو استخدم فيديو آخر.';
