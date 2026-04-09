@@ -21,20 +21,16 @@ let YOUTUBE_COOKIES_FILE = process.env.YTDLP_YOUTUBE_COOKIES_FILE || (fs.existsS
 let SOCIAL_COOKIES_FILE = process.env.YTDLP_SOCIAL_COOKIES_FILE || (fs.existsSync(path.join(__dirname, 'cookies2.txt')) ? path.join(__dirname, 'cookies2.txt') : GLOBAL_COOKIES_FILE);
 const HAS_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
-// Forced channel subscription (Dynamic from DB)
-let FORCED_CHANNEL_ID = process.env.FORCED_CHANNEL_ID || '';
-let CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || ''; // e.g., @mychannel
-let IS_SUBSCRIPTION_ENABLED = false;
+// Forced channel subscription
+const FORCED_CHANNEL_ID = process.env.FORCED_CHANNEL_ID || '';
+const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || ''; // e.g., @mychannel
 
 // Helper: Check if user is subscribed to the forced channel
 async function checkChannelSubscription(chatId) {
-  if (!IS_SUBSCRIPTION_ENABLED || !FORCED_CHANNEL_ID) {
-    // No forced channel configured or enabled, allow access
+  if (!FORCED_CHANNEL_ID) {
+    // No forced channel configured, allow access
     return true;
   }
-
-  // Admin is exempt
-  if (chatId === ADMIN_ID) return true;
 
   try {
     const member = await bot.getChatMember(FORCED_CHANNEL_ID, chatId);
@@ -42,7 +38,7 @@ async function checkChannelSubscription(chatId) {
     return ['member', 'administrator', 'creator'].includes(member.status);
   } catch (error) {
     console.error(`Error checking channel subscription for ${chatId}:`, error.message);
-    // If we can't check (e.g., bot not admin), allow access (fail-safe)
+    // If we can't check, allow access (fail-safe)
     return true;
   }
 }
@@ -144,34 +140,6 @@ const QUALITIES = {
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-}
-
-// Helper: Get all files in a directory recursively
-function getAllFiles(dirPath, arrayOfFiles) {
-  const files = fs.readdirSync(dirPath);
-  arrayOfFiles = arrayOfFiles || [];
-
-  files.forEach((file) => {
-    if (fs.statSync(path.join(dirPath, file)).isDirectory()) {
-      arrayOfFiles = getAllFiles(path.join(dirPath, file), arrayOfFiles);
-    } else {
-      arrayOfFiles.push(path.join(dirPath, file));
-    }
-  });
-
-  return arrayOfFiles;
-}
-
-// Helper: Download TikTok photos using gallery-dl
-function downloadTiktokPhotos(url, outputDir) {
-  return new Promise((resolve, reject) => {
-    // Use gallery-dl with a modern user-agent
-    const cmd = `gallery-dl -D "${outputDir}" --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" "${url}"`;
-    exec(cmd, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
-      // gallery-dl might exit with error if some files fail, but we check if anything was downloaded
-      resolve();
-    });
-  });
 }
 
 // Helper: Save stats to file
@@ -366,7 +334,7 @@ async function prepareCookiesFile(existingFile, remoteUrl, runtimeName) {
 }
 
 function buildYtDlpBaseArgs(cookiesFile = '') {
-  const args = ['--no-playlist', '--no-check-certificates'];
+  const args = ['--no-playlist'];
 
   if (cookiesFile) {
     args.push(`--cookies "${cookiesFile}"`);
@@ -379,7 +347,9 @@ function buildYoutubeDlpArgs(extraArgs = '') {
   // Always check current variable value which is updated at startup
   const baseArgs = [
     buildYtDlpBaseArgs(resolveCookiesFile('youtube')),
-    '--extractor-args "youtube:player_client=mweb,web;node_skip_verification=1"',
+    '--extractor-args "youtube:player_client=web;node_skip_verification=1"',
+    '--remote-components ejs:github',
+    '--js-runtimes node',
     '--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"'
   ];
 
@@ -391,10 +361,7 @@ function buildYoutubeDlpArgs(extraArgs = '') {
 }
 
 function buildSocialDlpArgs(extraArgs = '') {
-  const baseArgs = [
-    buildYtDlpBaseArgs(resolveCookiesFile('social')),
-    '--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"'
-  ];
+  const baseArgs = [buildYtDlpBaseArgs(resolveCookiesFile('social'))];
 
   if (extraArgs) {
     baseArgs.push(extraArgs);
@@ -443,6 +410,62 @@ function supabaseStorageRequest(endpointPath, { method = 'GET', body = null, con
 
     if (body !== null) {
       requestOptions.headers['Content-Type'] = contentType || 'application/octet-stream';
+
+  function downloadTextFromUrl(url, targetPath) {
+    return new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(targetPath);
+
+      const request = https.get(url, (response) => {
+        if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+          file.close(() => fs.unlink(targetPath, () => {}));
+          resolve(downloadTextFromUrl(response.headers.location, targetPath));
+          return;
+        }
+
+        if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+          file.close(() => fs.unlink(targetPath, () => {}));
+          reject(new Error(`Failed to download file from ${url} (status ${response.statusCode || 'unknown'})`));
+          return;
+        }
+
+        response.pipe(file);
+        file.on('finish', () => {
+          file.close(() => resolve(targetPath));
+        });
+      });
+
+      request.on('error', (error) => {
+        file.close(() => fs.unlink(targetPath, () => {}));
+        reject(error);
+      });
+
+      file.on('error', (error) => {
+        file.close(() => fs.unlink(targetPath, () => {}));
+        reject(error);
+      });
+    });
+  }
+
+  async function prepareCookiesFile(existingFile, remoteUrl, runtimeName) {
+    if (existingFile && fs.existsSync(existingFile)) {
+      return existingFile;
+    }
+
+    if (!remoteUrl) {
+      return '';
+    }
+
+    const runtimeDir = path.join(__dirname, '.runtime');
+    if (!fs.existsSync(runtimeDir)) {
+      fs.mkdirSync(runtimeDir, { recursive: true });
+    }
+
+    const runtimePath = path.join(runtimeDir, runtimeName);
+    console.log(`[Cookies] Downloading cookies from ${remoteUrl} to ${runtimePath}`);
+    await downloadTextFromUrl(remoteUrl, runtimePath);
+    console.log(`[Cookies] Downloaded successfully: ${runtimePath}`);
+    return runtimePath;
+  }
       requestOptions.headers['Content-Length'] = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(body);
     }
 
@@ -600,49 +623,6 @@ async function syncSupabaseState() {
   }
 }
 
-async function loadSettings() {
-  if (!HAS_SUPABASE) return;
-
-  try {
-    const settings = await supabaseRequest('/rest/v1/bot_settings', {
-      query: 'id=eq.1&select=forced_channel_id,channel_username,is_subscription_enabled'
-    });
-
-    if (Array.isArray(settings) && settings.length > 0) {
-      const row = settings[0];
-      FORCED_CHANNEL_ID = row.forced_channel_id || FORCED_CHANNEL_ID;
-      CHANNEL_USERNAME = row.channel_username || CHANNEL_USERNAME;
-      IS_SUBSCRIPTION_ENABLED = Boolean(row.is_subscription_enabled);
-      console.log(`[Config] Loaded settings from Supabase: Enabled=${IS_SUBSCRIPTION_ENABLED}, ID=${FORCED_CHANNEL_ID}`);
-    }
-  } catch (error) {
-    console.error('Failed to load settings from Supabase:', error.message);
-  }
-}
-
-async function saveSettings() {
-  if (!HAS_SUPABASE) return;
-
-  try {
-    await supabaseRequest('/rest/v1/bot_settings', {
-      method: 'POST',
-      query: 'on_conflict=id',
-      body: [
-        {
-          id: 1,
-          forced_channel_id: FORCED_CHANNEL_ID,
-          channel_username: CHANNEL_USERNAME,
-          is_subscription_enabled: IS_SUBSCRIPTION_ENABLED,
-          updated_at: new Date().toISOString()
-        }
-      ],
-      prefer: 'resolution=merge-duplicates,return=minimal'
-    });
-  } catch (error) {
-    console.error('Failed to save settings to Supabase:', error.message);
-  }
-}
-
 // Helper: Load stats from storage
 async function loadStats() {
   activeUsers.clear();
@@ -651,7 +631,6 @@ async function loadStats() {
 
   if (HAS_SUPABASE) {
     try {
-      await loadSettings();
       const [statsRows, usersRows, blockedRows] = await Promise.all([
         supabaseRequest('/rest/v1/bot_stats', {
           query: 'id=eq.1&select=id,total_downloads,total_videos,total_audios'
@@ -801,10 +780,10 @@ function downloadMediaFile(url, outputPath, platform = 'youtube') {
     
     if (platform === 'tiktok') {
       // TikTok-specific args: use native best format without re-encoding to avoid FPS issues
-      const args = buildSocialDlpArgs('--concurrent-fragments 4');
-      cmd = `yt-dlp ${args} -f "best" -o "${outputPath}" "${url}"`;
+      const args = buildSocialDlpArgs('--concurrent-fragments 8');
+      cmd = `yt-dlp ${args} -f "best" --no-recode -o "${outputPath}" "${url}"`;
     } else {
-      const args = platform === 'youtube' ? buildYoutubeDlpArgs('--concurrent-fragments 4') : buildSocialDlpArgs('--concurrent-fragments 4');
+      const args = platform === 'youtube' ? buildYoutubeDlpArgs('--concurrent-fragments 8') : buildSocialDlpArgs('--concurrent-fragments 8');
       cmd = `yt-dlp ${args} -f "best" -o "${outputPath}" "${url}"`;
     }
 
@@ -909,7 +888,7 @@ function downloadVideoFile(url, quality, outputPath) {
     const h = ytQualityMap[quality] || '720';
 
     // Use -f to select best video+audio with max height h
-    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 4')} -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
+    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       if (error) {
@@ -924,7 +903,7 @@ function downloadVideoFile(url, quality, outputPath) {
 // Helper: Download audio only
 function downloadAudioFile(url, outputPath) {
   return new Promise((resolve, reject) => {
-    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 4')} -x --audio-format mp3 -o "${outputPath}" "${url}"`;
+    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -x --audio-format mp3 -o "${outputPath}" "${url}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       if (error) {
@@ -1215,7 +1194,6 @@ bot.onText(/^\/admin(?:@\w+)?(?:\s|$)/, async (msg) => {
       inline_keyboard: [
         [{ text: '📊 الإحصائيات', callback_data: 'admin_stats' }],
         [{ text: '📢 بث رسالة', callback_data: 'admin_broadcast' }],
-        [{ text: '📢 قناة الاشتراك', callback_data: 'admin_channel_settings' }],
         [{ text: '🚫 قائمة المحظورين', callback_data: 'admin_blocked' }],
         [{ text: '👥 المستخدمين', callback_data: 'admin_users' }]
       ]
@@ -1368,25 +1346,6 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Handle admin inputs
-  if (isAdmin(chatId)) {
-    const state = userState.get(chatId);
-    if (state && state.waitingFor === 'channel_id') {
-      FORCED_CHANNEL_ID = text.trim();
-      userState.delete(chatId);
-      saveSettings();
-      bot.sendMessage(chatId, `✅ تم تعيين معرف القناة: \`${FORCED_CHANNEL_ID}\``, { parse_mode: 'Markdown' });
-      return;
-    }
-    if (state && state.waitingFor === 'channel_user') {
-      CHANNEL_USERNAME = text.trim().startsWith('@') ? text.trim() : `@${text.trim()}`;
-      userState.delete(chatId);
-      saveSettings();
-      bot.sendMessage(chatId, `✅ تم تعيين يوزر القناة: \`${CHANNEL_USERNAME}\``, { parse_mode: 'Markdown' });
-      return;
-    }
-  }
-
   // Skip commands
   if (text && text.startsWith('/')) return;
 
@@ -1479,63 +1438,6 @@ bot.on('message', async (msg) => {
 
   // Handle TikTok
   if (platform === 'tiktok') {
-    if (text.includes('/photo/')) {
-      const statusMsg = await bot.sendMessage(chatId, '🖼️ *تم اكتشاف ألبوم صور...*\n\n⏳ جاري استخراج الصور باستخدام gallery-dl...', { parse_mode: 'Markdown' });
-      
-      const photoDir = path.join(DOWNLOAD_DIR, `tiktok_photos_${chatId}_${Date.now()}`);
-      if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-
-      try {
-        await downloadTiktokPhotos(text, photoDir);
-        const files = getAllFiles(photoDir).filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f));
-
-        if (files.length === 0) {
-          bot.editMessageText('❌ تعذر العثور على صور في هذا الرابط.', {
-            chat_id: chatId,
-            message_id: statusMsg.message_id
-          });
-          return;
-        }
-
-        bot.editMessageText(`✅ تم العثور على ${files.length} صورة.\n\n📤 جاري الإرسال...`, {
-          chat_id: chatId,
-          message_id: statusMsg.message_id
-        });
-
-        // Send photos in groups of 10 (Telegram limit)
-        for (let i = 0; i < files.length; i += 10) {
-          const chunk = files.slice(i, i + 10);
-          const mediaGroup = chunk.map(file => ({
-            type: 'photo',
-            media: fs.createReadStream(file)
-          }));
-          await bot.sendMediaGroup(chatId, mediaGroup);
-        }
-
-        stats.totalDownloads++;
-        saveStats();
-
-      } catch (error) {
-        console.error('Gallery-dl error:', error);
-        bot.editMessageText('❌ خطأ أثناء تحميل الصور.', {
-          chat_id: chatId,
-          message_id: statusMsg.message_id
-        });
-      } finally {
-        // Cleanup photo directory
-        try {
-          if (fs.existsSync(photoDir)) {
-            const files = getAllFiles(photoDir);
-            files.forEach(f => fs.unlinkSync(f));
-            // Remove directories recursively (simplification: just the temp dir)
-            // Note: fs.rmSync is available in newer Node versions
-            fs.rmSync(photoDir, { recursive: true, force: true });
-          }
-        } catch (e) {}
-      }
-      return;
-    }
-
     try {
       bot.sendChatAction(chatId, 'typing');
       const info = await getMediaInfo(text, 'tiktok');
@@ -1604,12 +1506,7 @@ bot.on('message', async (msg) => {
 
     } catch (error) {
       console.error('TikTok error:', error);
-      const errorMsg = error.message || '';
-      if (errorMsg.includes('Unsupported URL') || errorMsg.includes('photo')) {
-        bot.sendMessage(chatId, '❌ عذراً، لا يدعم البوت تحميل هذا النوع من منشورات تيك توك (الصور أو السلايدشو).');
-      } else {
-        bot.sendMessage(chatId, '❌ خطأ في تحميل الفيديو. تأكد من أن الرابط صحيح والفيديو عام.');
-      }
+      bot.sendMessage(chatId, '❌ خطأ في تحميل الفيديو. تأكد من أن الرابط صحيح والفيديو عام.');
     }
     return;
   }
@@ -1788,67 +1685,6 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'admin_broadcast') {
       bot.deleteMessage(chatId, messageId).catch(() => {});
       bot.sendMessage(chatId, `📢 *لبث رسالة لجميع المستخدمين:*\n\nاستخدم الأمر:\n\`/broadcast رسالتك هنا\``, { parse_mode: 'Markdown' });
-    } else if (data === 'admin_channel_settings') {
-      const status = IS_SUBSCRIPTION_ENABLED ? '✅ مفعل' : '❌ معطل';
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: `الحالة: ${status}`, callback_data: 'admin_toggle_sub' }],
-          [{ text: 'تغيير الـ ID', callback_data: 'admin_set_channel_id' }],
-          [{ text: 'تغيير اليوزر (@)', callback_data: 'admin_set_channel_user' }],
-          [{ text: '🔙 عودة', callback_data: 'admin_back' }]
-        ]
-      };
-      bot.editMessageText(`📢 *إعدادات الاشتراك الإجباري:*\n\n🆔 المعرف: \`${FORCED_CHANNEL_ID || 'غير محدد'}\`\n👤 اليوزر: \`${CHANNEL_USERNAME || 'غير محدد'}\`\n📊 الحالة: ${status}`, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: keyboard
-      });
-    } else if (data === 'admin_toggle_sub') {
-      IS_SUBSCRIPTION_ENABLED = !IS_SUBSCRIPTION_ENABLED;
-      saveSettings();
-      // Refresh menu
-      const status = IS_SUBSCRIPTION_ENABLED ? '✅ مفعل' : '❌ معطل';
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: `الحالة: ${status}`, callback_data: 'admin_toggle_sub' }],
-          [{ text: 'تغيير الـ ID', callback_data: 'admin_set_channel_id' }],
-          [{ text: 'تغيير اليوزر (@)', callback_data: 'admin_set_channel_user' }],
-          [{ text: '🔙 عودة', callback_data: 'admin_back' }]
-        ]
-      };
-      bot.editMessageText(`📢 *إعدادات الاشتراك الإجباري:*\n\n🆔 المعرف: \`${FORCED_CHANNEL_ID || 'غير محدد'}\`\n👤 اليوزر: \`${CHANNEL_USERNAME || 'غير محدد'}\`\n📊 الحالة: ${status}`, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: keyboard
-      });
-    } else if (data === 'admin_set_channel_id') {
-      userState.set(chatId, { waitingFor: 'channel_id' });
-      bot.sendMessage(chatId, 'أرسل معرف القناة الجديد (يبدأ بـ -100):');
-    } else if (data === 'admin_set_channel_user') {
-      userState.set(chatId, { waitingFor: 'channel_user' });
-      bot.sendMessage(chatId, 'أرسل يوزر القناة الجديد (يبدأ بـ @):');
-    } else if (data === 'admin_back') {
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: '📊 الإحصائيات', callback_data: 'admin_stats' }],
-          [{ text: '📢 بث رسالة', callback_data: 'admin_broadcast' }],
-          [{ text: '📢 قناة الاشتراك', callback_data: 'admin_channel_settings' }],
-          [{ text: '🚫 قائمة المحظورين', callback_data: 'admin_blocked' }],
-          [{ text: '👥 المستخدمين', callback_data: 'admin_users' }]
-        ]
-      };
-      bot.editMessageText(`
-🔧 *لوحة تحكم المطور*
-
-اختر أحد الخيارات:
-      `, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: keyboard
-      });
     }
     return;
   }
