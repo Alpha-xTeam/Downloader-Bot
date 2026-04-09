@@ -338,7 +338,7 @@ async function prepareCookiesFile(existingFile, remoteUrl, runtimeName) {
 }
 
 function buildYtDlpBaseArgs(cookiesFile = '') {
-  const args = ['--no-playlist'];
+  const args = ['--no-playlist', '--no-check-certificates'];
 
   if (cookiesFile) {
     args.push(`--cookies "${cookiesFile}"`);
@@ -351,9 +351,7 @@ function buildYoutubeDlpArgs(extraArgs = '') {
   // Always check current variable value which is updated at startup
   const baseArgs = [
     buildYtDlpBaseArgs(resolveCookiesFile('youtube')),
-    '--extractor-args "youtube:player_client=web;node_skip_verification=1"',
-    '--remote-components ejs:github',
-    '--js-runtimes node',
+    '--extractor-args "youtube:player_client=android,ios;node_skip_verification=1"',
     '--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"'
   ];
 
@@ -828,10 +826,10 @@ function downloadMediaFile(url, outputPath, platform = 'youtube') {
     
     if (platform === 'tiktok') {
       // TikTok-specific args: use native best format without re-encoding to avoid FPS issues
-      const args = buildSocialDlpArgs('--concurrent-fragments 8');
-      cmd = `yt-dlp ${args} -f "best" --no-recode -o "${outputPath}" "${url}"`;
+      const args = buildSocialDlpArgs('--concurrent-fragments 4');
+      cmd = `yt-dlp ${args} -f "best" -o "${outputPath}" "${url}"`;
     } else {
-      const args = platform === 'youtube' ? buildYoutubeDlpArgs('--concurrent-fragments 8') : buildSocialDlpArgs('--concurrent-fragments 8');
+      const args = platform === 'youtube' ? buildYoutubeDlpArgs('--concurrent-fragments 4') : buildSocialDlpArgs('--concurrent-fragments 4');
       cmd = `yt-dlp ${args} -f "best" -o "${outputPath}" "${url}"`;
     }
 
@@ -936,7 +934,7 @@ function downloadVideoFile(url, quality, outputPath) {
     const h = ytQualityMap[quality] || '720';
 
     // Use -f to select best video+audio with max height h
-    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
+    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 4')} -f "bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best" -o "${outputPath}" --merge-output-format mp4 "${url}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       if (error) {
@@ -951,7 +949,7 @@ function downloadVideoFile(url, quality, outputPath) {
 // Helper: Download audio only
 function downloadAudioFile(url, outputPath) {
   return new Promise((resolve, reject) => {
-    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 8')} -x --audio-format mp3 -o "${outputPath}" "${url}"`;
+    const cmd = `yt-dlp ${buildYoutubeDlpArgs('--concurrent-fragments 4')} -x --audio-format mp3 -o "${outputPath}" "${url}"`;
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       if (error) {
