@@ -146,6 +146,34 @@ if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
 
+// Helper: Get all files in a directory recursively
+function getAllFiles(dirPath, arrayOfFiles) {
+  const files = fs.readdirSync(dirPath);
+  arrayOfFiles = arrayOfFiles || [];
+
+  files.forEach((file) => {
+    if (fs.statSync(path.join(dirPath, file)).isDirectory()) {
+      arrayOfFiles = getAllFiles(path.join(dirPath, file), arrayOfFiles);
+    } else {
+      arrayOfFiles.push(path.join(dirPath, file));
+    }
+  });
+
+  return arrayOfFiles;
+}
+
+// Helper: Download TikTok photos using gallery-dl
+function downloadTiktokPhotos(url, outputDir) {
+  return new Promise((resolve, reject) => {
+    // Use gallery-dl with a modern user-agent
+    const cmd = `gallery-dl -D "${outputDir}" --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" "${url}"`;
+    exec(cmd, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
+      // gallery-dl might exit with error if some files fail, but we check if anything was downloaded
+      resolve();
+    });
+  });
+}
+
 // Helper: Save stats to file
 function saveLocalStats() {
   try {
@@ -1451,6 +1479,63 @@ bot.on('message', async (msg) => {
 
   // Handle TikTok
   if (platform === 'tiktok') {
+    if (text.includes('/photo/')) {
+      const statusMsg = await bot.sendMessage(chatId, '🖼️ *تم اكتشاف ألبوم صور...*\n\n⏳ جاري استخراج الصور باستخدام gallery-dl...', { parse_mode: 'Markdown' });
+      
+      const photoDir = path.join(DOWNLOAD_DIR, `tiktok_photos_${chatId}_${Date.now()}`);
+      if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+
+      try {
+        await downloadTiktokPhotos(text, photoDir);
+        const files = getAllFiles(photoDir).filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f));
+
+        if (files.length === 0) {
+          bot.editMessageText('❌ تعذر العثور على صور في هذا الرابط.', {
+            chat_id: chatId,
+            message_id: statusMsg.message_id
+          });
+          return;
+        }
+
+        bot.editMessageText(`✅ تم العثور على ${files.length} صورة.\n\n📤 جاري الإرسال...`, {
+          chat_id: chatId,
+          message_id: statusMsg.message_id
+        });
+
+        // Send photos in groups of 10 (Telegram limit)
+        for (let i = 0; i < files.length; i += 10) {
+          const chunk = files.slice(i, i + 10);
+          const mediaGroup = chunk.map(file => ({
+            type: 'photo',
+            media: fs.createReadStream(file)
+          }));
+          await bot.sendMediaGroup(chatId, mediaGroup);
+        }
+
+        stats.totalDownloads++;
+        saveStats();
+
+      } catch (error) {
+        console.error('Gallery-dl error:', error);
+        bot.editMessageText('❌ خطأ أثناء تحميل الصور.', {
+          chat_id: chatId,
+          message_id: statusMsg.message_id
+        });
+      } finally {
+        // Cleanup photo directory
+        try {
+          if (fs.existsSync(photoDir)) {
+            const files = getAllFiles(photoDir);
+            files.forEach(f => fs.unlinkSync(f));
+            // Remove directories recursively (simplification: just the temp dir)
+            // Note: fs.rmSync is available in newer Node versions
+            fs.rmSync(photoDir, { recursive: true, force: true });
+          }
+        } catch (e) {}
+      }
+      return;
+    }
+
     try {
       bot.sendChatAction(chatId, 'typing');
       const info = await getMediaInfo(text, 'tiktok');
@@ -1519,7 +1604,12 @@ bot.on('message', async (msg) => {
 
     } catch (error) {
       console.error('TikTok error:', error);
-      bot.sendMessage(chatId, '❌ خطأ في تحميل الفيديو. تأكد من أن الرابط صحيح والفيديو عام.');
+      const errorMsg = error.message || '';
+      if (errorMsg.includes('Unsupported URL') || errorMsg.includes('photo')) {
+        bot.sendMessage(chatId, '❌ عذراً، لا يدعم البوت تحميل هذا النوع من منشورات تيك توك (الصور أو السلايدشو).');
+      } else {
+        bot.sendMessage(chatId, '❌ خطأ في تحميل الفيديو. تأكد من أن الرابط صحيح والفيديو عام.');
+      }
     }
     return;
   }
