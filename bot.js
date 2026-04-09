@@ -21,6 +21,62 @@ let YOUTUBE_COOKIES_FILE = process.env.YTDLP_YOUTUBE_COOKIES_FILE || (fs.existsS
 let SOCIAL_COOKIES_FILE = process.env.YTDLP_SOCIAL_COOKIES_FILE || (fs.existsSync(path.join(__dirname, 'cookies2.txt')) ? path.join(__dirname, 'cookies2.txt') : GLOBAL_COOKIES_FILE);
 const HAS_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 
+// Forced channel subscription (Dynamic from DB)
+let FORCED_CHANNEL_ID = process.env.FORCED_CHANNEL_ID || '';
+let CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || ''; // e.g., @mychannel
+let IS_SUBSCRIPTION_ENABLED = false;
+
+// Helper: Check if user is subscribed to the forced channel
+async function checkChannelSubscription(chatId) {
+  if (!IS_SUBSCRIPTION_ENABLED || !FORCED_CHANNEL_ID) {
+    // No forced channel configured or enabled, allow access
+    return true;
+  }
+
+  // Admin is exempt
+  if (chatId === ADMIN_ID) return true;
+
+  try {
+    const member = await bot.getChatMember(FORCED_CHANNEL_ID, chatId);
+    // User is a member if status is: member, administrator, or creator
+    return ['member', 'administrator', 'creator'].includes(member.status);
+  } catch (error) {
+    console.error(`Error checking channel subscription for ${chatId}:`, error.message);
+    // If we can't check (e.g., bot not admin), allow access (fail-safe)
+    return true;
+  }
+}
+
+// Helper: Send channel subscription required message
+function sendChannelSubscriptionMessage(chatId) {
+  const channelLink = CHANNEL_USERNAME ? `https://t.me/${CHANNEL_USERNAME.replace('@', '')}` : 'القناة';
+  
+  const message = `
+⚠️ *استخدام البوت يتطلب الاشتراك في القناة*
+
+📢 يجب عليك الاشتراك في قناتنا أولاً لاستخدام البوت
+
+👇 *اشترك الآن:*
+[${CHANNEL_USERNAME || 'اضغط هنا للاشتراك'}](${channelLink})
+
+✅ *بعد الاشتراك:*
+1️⃣ عد للبوت
+2️⃣ أرسل /start
+3️⃣ استمتع بالتحميل!
+
+_سيتم التحقق تلقائياً من اشتراكك_
+  `;
+
+  bot.sendMessage(chatId, message, { 
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '📢 اشترك في القناة', url: channelLink }
+      ]]
+    }
+  });
+}
+
 function resolveCookiesFile(platform) {
   const runtimeFileName = platform === 'youtube' ? 'cookies-youtube.txt' : 'cookies-social.txt';
   const fallbackLocalFile = platform === 'youtube' ? 'cookies.txt' : 'cookies2.txt';
@@ -571,6 +627,49 @@ async function syncSupabaseState() {
   }
 }
 
+async function loadSettings() {
+  if (!HAS_SUPABASE) return;
+
+  try {
+    const settings = await supabaseRequest('/rest/v1/bot_settings', {
+      query: 'id=eq.1&select=forced_channel_id,channel_username,is_subscription_enabled'
+    });
+
+    if (Array.isArray(settings) && settings.length > 0) {
+      const row = settings[0];
+      FORCED_CHANNEL_ID = row.forced_channel_id || FORCED_CHANNEL_ID;
+      CHANNEL_USERNAME = row.channel_username || CHANNEL_USERNAME;
+      IS_SUBSCRIPTION_ENABLED = Boolean(row.is_subscription_enabled);
+      console.log(`[Config] Loaded settings from Supabase: Enabled=${IS_SUBSCRIPTION_ENABLED}, ID=${FORCED_CHANNEL_ID}`);
+    }
+  } catch (error) {
+    console.error('Failed to load settings from Supabase:', error.message);
+  }
+}
+
+async function saveSettings() {
+  if (!HAS_SUPABASE) return;
+
+  try {
+    await supabaseRequest('/rest/v1/bot_settings', {
+      method: 'POST',
+      query: 'on_conflict=id',
+      body: [
+        {
+          id: 1,
+          forced_channel_id: FORCED_CHANNEL_ID,
+          channel_username: CHANNEL_USERNAME,
+          is_subscription_enabled: IS_SUBSCRIPTION_ENABLED,
+          updated_at: new Date().toISOString()
+        }
+      ],
+      prefer: 'resolution=merge-duplicates,return=minimal'
+    });
+  } catch (error) {
+    console.error('Failed to save settings to Supabase:', error.message);
+  }
+}
+
 // Helper: Load stats from storage
 async function loadStats() {
   activeUsers.clear();
@@ -579,6 +678,7 @@ async function loadStats() {
 
   if (HAS_SUPABASE) {
     try {
+      await loadSettings();
       const [statsRows, usersRows, blockedRows] = await Promise.all([
         supabaseRequest('/rest/v1/bot_stats', {
           query: 'id=eq.1&select=id,total_downloads,total_videos,total_audios'
@@ -724,8 +824,16 @@ function getMediaInfo(url, platform = 'youtube') {
 // Helper: Download from any supported platform
 function downloadMediaFile(url, outputPath, platform = 'youtube') {
   return new Promise((resolve, reject) => {
-    const args = platform === 'youtube' ? buildYoutubeDlpArgs('--concurrent-fragments 8') : buildSocialDlpArgs('--concurrent-fragments 8');
-    const cmd = `yt-dlp ${args} -f "best" -o "${outputPath}" "${url}"`;
+    let cmd;
+    
+    if (platform === 'tiktok') {
+      // TikTok-specific args: use native best format without re-encoding to avoid FPS issues
+      const args = buildSocialDlpArgs('--concurrent-fragments 8');
+      cmd = `yt-dlp ${args} -f "best" --no-recode -o "${outputPath}" "${url}"`;
+    } else {
+      const args = platform === 'youtube' ? buildYoutubeDlpArgs('--concurrent-fragments 8') : buildSocialDlpArgs('--concurrent-fragments 8');
+      cmd = `yt-dlp ${args} -f "best" -o "${outputPath}" "${url}"`;
+    }
 
     exec(cmd, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       if (error) {
@@ -906,6 +1014,13 @@ bot.onText(/^\/start(?:@\w+)?(?:\s|$)/, async (msg) => {
     return;
   }
 
+  // Check channel subscription
+  const isSubscribed = await checkChannelSubscription(chatId);
+  if (!isSubscribed) {
+    sendChannelSubscriptionMessage(chatId);
+    return;
+  }
+
   const welcomeMessage = `
 👋 *أهلاً بك في بوت التحميل!*
 
@@ -944,6 +1059,13 @@ bot.onText(/^\/help(?:@\w+)?(?:\s|$)/, async (msg) => {
 
   if (blockedUsers.has(chatId)) {
     bot.sendMessage(chatId, '❌ عذراً، حسابك محظور من استخدام هذا البوت.');
+    return;
+  }
+
+  // Check channel subscription
+  const isSubscribed = await checkChannelSubscription(chatId);
+  if (!isSubscribed) {
+    sendChannelSubscriptionMessage(chatId);
     return;
   }
 
@@ -996,6 +1118,13 @@ bot.onText(/^\/audio(?:@\w+)?(?:\s|$)/, async (msg) => {
     return;
   }
 
+  // Check channel subscription
+  const isSubscribed = await checkChannelSubscription(chatId);
+  if (!isSubscribed) {
+    sendChannelSubscriptionMessage(chatId);
+    return;
+  }
+
   userState.set(chatId, { audioOnly: true });
   bot.sendMessage(chatId, '🎵 *تم تفعيل وضع الصوت*\n\nأرسل رابط يوتيوب لتحميل الصوت فقط.\n\nاستخدم /video للعودة للفيديو.', { parse_mode: 'Markdown' });
 });
@@ -1010,6 +1139,13 @@ bot.onText(/^\/video(?:@\w+)?(?:\s|$)/, async (msg) => {
     return;
   }
 
+  // Check channel subscription
+  const isSubscribed = await checkChannelSubscription(chatId);
+  if (!isSubscribed) {
+    sendChannelSubscriptionMessage(chatId);
+    return;
+  }
+
   userState.set(chatId, { audioOnly: false });
   bot.sendMessage(chatId, '🎬 *تم تفعيل وضع الفيديو*\n\nأرسل رابط يوتيوب لتحميل الفيديو.', { parse_mode: 'Markdown' });
 });
@@ -1021,6 +1157,13 @@ bot.onText(/^\/search(?:@\w+)?\s+(.+)/, async (msg, match) => {
 
   if (blockedUsers.has(chatId)) {
     bot.sendMessage(chatId, '❌ عذراً، حسابك محظور من استخدام هذا البوت.');
+    return;
+  }
+
+  // Check channel subscription
+  const isSubscribed = await checkChannelSubscription(chatId);
+  if (!isSubscribed) {
+    sendChannelSubscriptionMessage(chatId);
     return;
   }
 
@@ -1099,6 +1242,7 @@ bot.onText(/^\/admin(?:@\w+)?(?:\s|$)/, async (msg) => {
       inline_keyboard: [
         [{ text: '📊 الإحصائيات', callback_data: 'admin_stats' }],
         [{ text: '📢 بث رسالة', callback_data: 'admin_broadcast' }],
+        [{ text: '📢 قناة الاشتراك', callback_data: 'admin_channel_settings' }],
         [{ text: '🚫 قائمة المحظورين', callback_data: 'admin_blocked' }],
         [{ text: '👥 المستخدمين', callback_data: 'admin_users' }]
       ]
@@ -1242,6 +1386,32 @@ bot.on('message', async (msg) => {
   if (blockedUsers.has(chatId)) {
     bot.sendMessage(chatId, '❌ عذراً، حسابك محظور من استخدام هذا البوت.');
     return;
+  }
+
+  // Check channel subscription
+  const isSubscribed = await checkChannelSubscription(chatId);
+  if (!isSubscribed) {
+    sendChannelSubscriptionMessage(chatId);
+    return;
+  }
+
+  // Handle admin inputs
+  if (isAdmin(chatId)) {
+    const state = userState.get(chatId);
+    if (state && state.waitingFor === 'channel_id') {
+      FORCED_CHANNEL_ID = text.trim();
+      userState.delete(chatId);
+      saveSettings();
+      bot.sendMessage(chatId, `✅ تم تعيين معرف القناة: \`${FORCED_CHANNEL_ID}\``, { parse_mode: 'Markdown' });
+      return;
+    }
+    if (state && state.waitingFor === 'channel_user') {
+      CHANNEL_USERNAME = text.trim().startsWith('@') ? text.trim() : `@${text.trim()}`;
+      userState.delete(chatId);
+      saveSettings();
+      bot.sendMessage(chatId, `✅ تم تعيين يوزر القناة: \`${CHANNEL_USERNAME}\``, { parse_mode: 'Markdown' });
+      return;
+    }
   }
 
   // Skip commands
@@ -1558,6 +1728,13 @@ bot.on('callback_query', async (callbackQuery) => {
     return;
   }
 
+  // Check channel subscription
+  const isSubscribed = await checkChannelSubscription(chatId);
+  if (!isSubscribed) {
+    sendChannelSubscriptionMessage(chatId);
+    return;
+  }
+
   // Admin callbacks
   if (data.startsWith('admin_')) {
     if (!isAdmin(chatId)) return;
@@ -1576,6 +1753,67 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'admin_broadcast') {
       bot.deleteMessage(chatId, messageId).catch(() => {});
       bot.sendMessage(chatId, `📢 *لبث رسالة لجميع المستخدمين:*\n\nاستخدم الأمر:\n\`/broadcast رسالتك هنا\``, { parse_mode: 'Markdown' });
+    } else if (data === 'admin_channel_settings') {
+      const status = IS_SUBSCRIPTION_ENABLED ? '✅ مفعل' : '❌ معطل';
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: `الحالة: ${status}`, callback_data: 'admin_toggle_sub' }],
+          [{ text: 'تغيير الـ ID', callback_data: 'admin_set_channel_id' }],
+          [{ text: 'تغيير اليوزر (@)', callback_data: 'admin_set_channel_user' }],
+          [{ text: '🔙 عودة', callback_data: 'admin_back' }]
+        ]
+      };
+      bot.editMessageText(`📢 *إعدادات الاشتراك الإجباري:*\n\n🆔 المعرف: \`${FORCED_CHANNEL_ID || 'غير محدد'}\`\n👤 اليوزر: \`${CHANNEL_USERNAME || 'غير محدد'}\`\n📊 الحالة: ${status}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      });
+    } else if (data === 'admin_toggle_sub') {
+      IS_SUBSCRIPTION_ENABLED = !IS_SUBSCRIPTION_ENABLED;
+      saveSettings();
+      // Refresh menu
+      const status = IS_SUBSCRIPTION_ENABLED ? '✅ مفعل' : '❌ معطل';
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: `الحالة: ${status}`, callback_data: 'admin_toggle_sub' }],
+          [{ text: 'تغيير الـ ID', callback_data: 'admin_set_channel_id' }],
+          [{ text: 'تغيير اليوزر (@)', callback_data: 'admin_set_channel_user' }],
+          [{ text: '🔙 عودة', callback_data: 'admin_back' }]
+        ]
+      };
+      bot.editMessageText(`📢 *إعدادات الاشتراك الإجباري:*\n\n🆔 المعرف: \`${FORCED_CHANNEL_ID || 'غير محدد'}\`\n👤 اليوزر: \`${CHANNEL_USERNAME || 'غير محدد'}\`\n📊 الحالة: ${status}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      });
+    } else if (data === 'admin_set_channel_id') {
+      userState.set(chatId, { waitingFor: 'channel_id' });
+      bot.sendMessage(chatId, 'أرسل معرف القناة الجديد (يبدأ بـ -100):');
+    } else if (data === 'admin_set_channel_user') {
+      userState.set(chatId, { waitingFor: 'channel_user' });
+      bot.sendMessage(chatId, 'أرسل يوزر القناة الجديد (يبدأ بـ @):');
+    } else if (data === 'admin_back') {
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: '📊 الإحصائيات', callback_data: 'admin_stats' }],
+          [{ text: '📢 بث رسالة', callback_data: 'admin_broadcast' }],
+          [{ text: '📢 قناة الاشتراك', callback_data: 'admin_channel_settings' }],
+          [{ text: '🚫 قائمة المحظورين', callback_data: 'admin_blocked' }],
+          [{ text: '👥 المستخدمين', callback_data: 'admin_users' }]
+        ]
+      };
+      bot.editMessageText(`
+🔧 *لوحة تحكم المطور*
+
+اختر أحد الخيارات:
+      `, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      });
     }
     return;
   }

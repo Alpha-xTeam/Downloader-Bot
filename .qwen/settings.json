@@ -14,7 +14,8 @@
       "Bash(c:\\ffmpeg\\ffmpeg-8.1-essentials_build\\bin\\ffmpeg.exe *)",
       "Bash(supabase *)",
       "Bash(c:\\supabase\\supabase.exe *)",
-      "Bash(chcp *)"
+      "Bash(chcp *)",
+      "Bash(node *)"
     ]
   },
   "$version": 3
