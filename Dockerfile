@@ -9,6 +9,7 @@ RUN apt-get update \
     ca-certificates \
     ffmpeg \
     curl \
+    unzip \
     python3 \
     python3-pip \
   && rm -rf /var/lib/apt/lists/*
